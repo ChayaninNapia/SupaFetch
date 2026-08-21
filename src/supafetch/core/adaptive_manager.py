@@ -16,3 +16,12 @@ class DownloadManager(BaseDownloadManager):
     def __init__(self, client) -> None:
         super().__init__(client)
         self.optimizer = PerformanceOptimizer()
+
+        # V4/V4.1 profiles remain useful as low-weight priors, but the first
+        # transfer after each V5 app start must collect fresh preflight
+        # evidence. This prevents a historical bad/outlier profile from
+        # bypassing the corrected V4.1 probe. Once V5 learns a real transfer
+        # in this process, last_runtime_epoch is refreshed and cache reuse
+        # works normally for following downloads.
+        for profile in self.optimizer.profiles._profiles.values():
+            profile.last_runtime_epoch = 0.0
