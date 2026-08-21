@@ -19,6 +19,7 @@ class HostProfile:
     best_speed_bps: int = 0
     range_supported: bool = True
     last_probe_epoch: float = 0.0
+    confidence: str = "low"
 
 
 class HostProfileStore:
@@ -43,6 +44,7 @@ class HostProfileStore:
                     best_speed_bps=max(0, int(values.get("best_speed_bps", 0))),
                     range_supported=bool(values.get("range_supported", True)),
                     last_probe_epoch=float(values.get("last_probe_epoch", 0.0)),
+                    confidence=str(values.get("confidence", "low")),
                 )
             except Exception:
                 logger.warning("Ignoring invalid host profile for %s", host)
@@ -58,14 +60,16 @@ class HostProfileStore:
             best_speed_bps=result.peak_speed_bps,
             range_supported=result.range_supported,
             last_probe_epoch=time.time(),
+            confidence=result.confidence,
         )
         self._save()
         logger.info(
-            "Saved preflight profile host=%s best_connections=%s peak=%sB/s range=%s",
+            "Saved preflight profile host=%s best_connections=%s peak=%sB/s range=%s confidence=%s",
             result.host,
             result.best_connections,
             result.peak_speed_bps,
             result.range_supported,
+            result.confidence,
         )
 
     def update_actual_speed(self, host: str, connections: int, speed_bps: int) -> None:
@@ -78,6 +82,7 @@ class HostProfileStore:
                 best_speed_bps=speed_bps,
                 range_supported=True,
                 last_probe_epoch=0.0,
+                confidence="real-transfer",
             )
             self._save()
             return
@@ -99,6 +104,7 @@ class HostProfileStore:
         current = self._profiles.get(host, HostProfile())
         reduced = PerformanceOptimizer.previous_level(current_connections)
         current.best_connections = reduced
+        current.confidence = "degraded"
         self._profiles[host] = current
         self._save()
         logger.info("Reduced learned host connections after error host=%s -> %s", host, reduced)
@@ -109,6 +115,9 @@ class HostProfileStore:
             return 1
         return max(1, min(16, profile.best_connections or 2))
 
+    def fallback_confidence(self, host: str) -> str:
+        return self.get(host).confidence
+
     def _save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,6 +127,7 @@ class HostProfileStore:
                     "best_speed_bps": profile.best_speed_bps,
                     "range_supported": profile.range_supported,
                     "last_probe_epoch": profile.last_probe_epoch,
+                    "confidence": profile.confidence,
                 }
                 for host, profile in self._profiles.items()
             }
@@ -147,9 +157,9 @@ class TransferState:
 class PerformanceOptimizer:
     """Track transfers after the preflight benchmark.
 
-    Phase 2 deliberately avoids increasing concurrency during an active transfer.
-    The only mid-download connection change is a conservative fallback when a
-    previously active transfer stalls repeatedly.
+    Phase 2 avoids increasing concurrency during an active transfer. The only
+    mid-download connection change is a conservative fallback after a sustained
+    stall.
     """
 
     CONNECTION_LEVELS = (1, 2, 4, 8, 16)
@@ -165,20 +175,32 @@ class PerformanceOptimizer:
     def fallback_connections(self, host: str) -> int:
         return self.profiles.fallback_connections(host)
 
-    def register(self, gid: str, host: str, connections: int, source: str) -> None:
+    def fallback_confidence(self, host: str) -> str:
+        return self.profiles.fallback_confidence(host)
+
+    def register(
+        self,
+        gid: str,
+        host: str,
+        connections: int,
+        source: str,
+        confidence: str = "",
+    ) -> None:
         normalized = self.normalize_level(connections)
-        mode = f"{source}:{normalized}c"
+        suffix = f" ({confidence.title()})" if confidence else ""
+        mode = f"{source}:{normalized}c{suffix}"
         self.states[gid] = TransferState(
             host=host,
             connections=normalized,
             mode=mode,
         )
         logger.info(
-            "Performance tracker registered gid=%s host=%s connections=%s source=%s",
+            "Performance tracker registered gid=%s host=%s connections=%s source=%s confidence=%s",
             gid,
             host,
             normalized,
             source,
+            confidence or "n/a",
         )
 
     def remove(self, gid: str) -> None:
