@@ -45,13 +45,27 @@ class Aria2Client:
         logger.debug("RPC <- %s id=%s ok", method, request_id)
         return data.get("result")
 
-    def add_uri(self, url: str, directory: str | None = None) -> str:
-        options: dict[str, str] = {}
+    def add_uri(
+        self,
+        url: str,
+        directory: str | None = None,
+        options: dict[str, str] | None = None,
+    ) -> str:
+        aria_options = dict(options or {})
         if directory:
-            options["dir"] = directory
-        gid = self._call("aria2.addUri", [url], options)
-        logger.info("Download added gid=%s host=%s", gid, urlparse(url).hostname)
+            aria_options["dir"] = directory
+        gid = self._call("aria2.addUri", [url], aria_options)
+        logger.info(
+            "Download added gid=%s host=%s options=%s",
+            gid,
+            urlparse(url).hostname,
+            aria_options,
+        )
         return gid
+
+    def change_option(self, gid: str, options: dict[str, str]) -> str:
+        logger.info("Changing download options gid=%s options=%s", gid, options)
+        return self._call("aria2.changeOption", gid, options)
 
     def pause(self, gid: str) -> str:
         logger.info("Pause requested gid=%s", gid)
