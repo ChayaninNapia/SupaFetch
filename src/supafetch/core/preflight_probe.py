@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 import re
+import statistics
+import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
@@ -15,18 +18,50 @@ _CONTENT_RANGE_RE = re.compile(r"bytes\s+\d+-\d+/(\d+|\*)", re.IGNORECASE)
 
 
 @dataclass(slots=True)
+class ProbeWorkerResult:
+    success: bool
+    measured_bytes: int = 0
+    elapsed_seconds: float = 0.0
+    retries: int = 0
+    error: str = ""
+
+    @property
+    def speed_bps(self) -> int:
+        if not self.success or self.elapsed_seconds <= 0:
+            return 0
+        return int(self.measured_bytes / self.elapsed_seconds)
+
+
+@dataclass(slots=True)
 class ProbeMeasurement:
     connections: int
     speed_bps: int
     bytes_downloaded: int
     elapsed_seconds: float
-    success: bool = True
+    successful_workers: int
+    total_workers: int
+    retries: int = 0
+    errors: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def success_ratio(self) -> float:
+        if self.total_workers <= 0:
+            return 0.0
+        return self.successful_workers / self.total_workers
+
+    @property
+    def effective_speed_bps(self) -> int:
+        return int(self.speed_bps * self.success_ratio)
 
     @property
     def efficiency_bps_per_connection(self) -> int:
         if self.connections <= 0:
             return 0
         return int(self.speed_bps / self.connections)
+
+    @property
+    def usable(self) -> bool:
+        return self.speed_bps > 0 and self.success_ratio >= RangePreflightProbe.MIN_SUCCESS_RATIO
 
 
 @dataclass(slots=True)
@@ -36,34 +71,46 @@ class PreflightResult:
     total_bytes: int
     best_connections: int
     peak_speed_bps: int = 0
-    source: str = "probe"
+    source: str = "probe-v2"
+    confidence: str = "low"
     measurements: list[ProbeMeasurement] = field(default_factory=list)
     note: str = ""
 
     @property
     def summary(self) -> str:
         if not self.measurements:
-            return f"{self.source}: {self.best_connections} connection(s)"
+            return f"{self.source}: {self.best_connections} connection(s) [{self.confidence}]"
         points = ", ".join(
-            f"{item.connections}c={item.speed_bps / (1024 * 1024):.2f}MB/s"
+            (
+                f"{item.connections}c={item.speed_bps / (1024 * 1024):.2f}MB/s"
+                f"@{item.success_ratio * 100:.0f}%"
+            )
             for item in self.measurements
-            if item.success
+            if item.speed_bps > 0
         )
-        return f"{points} -> {self.best_connections}c"
+        return f"{points} -> {self.best_connections}c [{self.confidence}]"
 
 
 class RangePreflightProbe:
-    """Measure HTTP Range scalability before handing the URL to aria2.
+    """Preflight V2: estimate steady HTTP Range scalability before aria2 starts.
 
-    The probe intentionally downloads only small, non-overlapping byte ranges.
-    It never logs the full URL so signed tokens do not leak into debug output.
+    Each worker opens one ranged response, consumes a small warm-up portion to
+    get past connection startup effects, then measures only steady-state bytes.
+    A failed worker is retried once and contributes to a reliability score
+    instead of making the whole concurrency level fail immediately.
     """
 
     CONNECTION_LEVELS = (1, 2, 4, 8, 16)
     MIN_IMPROVEMENT = 0.08
     NEAR_PEAK_RATIO = 0.95
+    MIN_SUCCESS_RATIO = 0.75
+    HIGH_SUCCESS_RATIO = 0.95
+    WARMUP_BYTES = 256 * 1024
+    MEASURE_SECONDS = 2.0
+    WARMUP_SYNC_TIMEOUT = 4.0
+    MAX_PROBE_SECONDS = 28.0
+    MAX_ATTEMPTS_PER_WORKER = 2
     USER_AGENT = "SupaFetch/0.1"
-    MAX_PROBE_SECONDS = 15.0
 
     def run(self, url: str) -> PreflightResult:
         host = (urlparse(url).hostname or "unknown").lower()
@@ -72,9 +119,10 @@ class RangePreflightProbe:
             range_supported, total_bytes = self._inspect(url)
         except Exception as exc:
             logger.warning(
-                "Preflight inspection failed host=%s error=%s",
+                "Preflight inspection failed host=%s error=%s: %s",
                 host,
                 type(exc).__name__,
+                self._safe_error(exc),
             )
             return PreflightResult(
                 host=host,
@@ -82,7 +130,8 @@ class RangePreflightProbe:
                 total_bytes=0,
                 best_connections=2,
                 source="probe-failed",
-                note=str(exc),
+                confidence="low",
+                note=self._safe_error(exc),
             )
 
         if not range_supported:
@@ -93,68 +142,97 @@ class RangePreflightProbe:
                 total_bytes=total_bytes,
                 best_connections=1,
                 source="no-range",
+                confidence="high",
             )
 
         levels = self._levels_for_size(total_bytes)
-        chunk_size = self._chunk_size(total_bytes)
         measurements: list[ProbeMeasurement] = []
         plateau_count = 0
-        previous_speed = 0
+        previous_effective_speed = 0
 
         logger.info(
-            "Preflight benchmark host=%s total=%s levels=%s chunk=%s",
+            "Preflight V2 benchmark host=%s total=%s levels=%s warmup=%s measure_window=%.1fs budget=%.0fs",
             host,
             total_bytes,
             levels,
-            chunk_size,
+            self.WARMUP_BYTES,
+            self.MEASURE_SECONDS,
+            self.MAX_PROBE_SECONDS,
         )
 
         for connections in levels:
-            if time.monotonic() - probe_started >= self.MAX_PROBE_SECONDS:
-                logger.info("Preflight time budget reached host=%s", host)
+            if measurements and time.monotonic() - probe_started >= self.MAX_PROBE_SECONDS:
+                logger.info(
+                    "Preflight time budget reached host=%s after %s level(s)",
+                    host,
+                    len(measurements),
+                )
                 break
 
             measurement = self._measure_level(
                 url=url,
                 total_bytes=total_bytes,
                 connections=connections,
-                chunk_size=chunk_size,
+                measure_bytes=self._measure_bytes_per_worker(connections),
             )
-            if not measurement.success:
+            measurements.append(measurement)
+
+            error_text = ""
+            if measurement.errors:
+                error_text = " errors=" + ", ".join(
+                    f"{name} x{count}" for name, count in sorted(measurement.errors.items())
+                )
+
+            logger.info(
+                "Preflight V2 result host=%s connections=%s speed=%.2fMB/s effective=%.2fMB/s success=%s/%s(%.0f%%) retries=%s elapsed=%.3fs efficiency=%.2fMB/s/conn%s",
+                host,
+                connections,
+                measurement.speed_bps / (1024 * 1024),
+                measurement.effective_speed_bps / (1024 * 1024),
+                measurement.successful_workers,
+                measurement.total_workers,
+                measurement.success_ratio * 100,
+                measurement.retries,
+                measurement.elapsed_seconds,
+                measurement.efficiency_bps_per_connection / (1024 * 1024),
+                error_text,
+            )
+
+            if measurement.successful_workers == 0:
                 logger.warning(
-                    "Preflight level failed host=%s connections=%s",
+                    "Preflight level unusable host=%s connections=%s: all workers failed",
                     host,
                     connections,
                 )
                 break
 
-            measurements.append(measurement)
-            logger.info(
-                "Preflight result host=%s connections=%s speed=%.2fMB/s elapsed=%.3fs efficiency=%.2fMB/s/conn",
-                host,
-                connections,
-                measurement.speed_bps / (1024 * 1024),
-                measurement.elapsed_seconds,
-                measurement.efficiency_bps_per_connection / (1024 * 1024),
-            )
+            if measurement.success_ratio < self.MIN_SUCCESS_RATIO:
+                logger.warning(
+                    "Preflight level unstable host=%s connections=%s success_ratio=%.0f%%; not probing higher concurrency",
+                    host,
+                    connections,
+                    measurement.success_ratio * 100,
+                )
+                break
 
-            if previous_speed > 0:
-                improvement = (measurement.speed_bps / previous_speed) - 1.0
+            if previous_effective_speed > 0:
+                improvement = (
+                    measurement.effective_speed_bps / max(1, previous_effective_speed)
+                ) - 1.0
                 if improvement < self.MIN_IMPROVEMENT:
                     plateau_count += 1
                 else:
                     plateau_count = 0
                 logger.debug(
-                    "Preflight scaling host=%s %sc improvement=%.1f%% plateau_count=%s",
+                    "Preflight V2 scaling host=%s %sc improvement=%.1f%% plateau_count=%s reliability=%.0f%%",
                     host,
                     connections,
                     improvement * 100,
                     plateau_count,
+                    measurement.success_ratio * 100,
                 )
-            previous_speed = measurement.speed_bps
+            previous_effective_speed = measurement.effective_speed_bps
 
-            # Two consecutive weak scaling steps are enough evidence that the
-            # server/path is saturated. Avoid wasting more bandwidth probing.
             if plateau_count >= 2:
                 logger.info(
                     "Preflight saturation detected host=%s at <=%s connections",
@@ -163,37 +241,38 @@ class RangePreflightProbe:
                 )
                 break
 
-        successful = [item for item in measurements if item.success and item.speed_bps > 0]
-        if not successful:
+        usable = [item for item in measurements if item.usable]
+        if not usable:
             return PreflightResult(
                 host=host,
                 range_supported=True,
                 total_bytes=total_bytes,
                 best_connections=2,
                 source="probe-failed",
+                confidence="low",
                 measurements=measurements,
-                note="No successful throughput samples",
+                note="No reliable steady-state throughput samples",
             )
 
-        peak_speed = max(item.speed_bps for item in successful)
+        peak_effective = max(item.effective_speed_bps for item in usable)
         near_peak = [
             item
-            for item in successful
-            if item.speed_bps >= peak_speed * self.NEAR_PEAK_RATIO
+            for item in usable
+            if item.effective_speed_bps >= peak_effective * self.NEAR_PEAK_RATIO
         ]
-        # Prefer the smallest concurrency that already reaches 95% of peak.
-        # This avoids extra server load and connection overhead for tiny gains.
         best = min(near_peak, key=lambda item: item.connections)
+        confidence = self._confidence(best, usable)
         result = PreflightResult(
             host=host,
             range_supported=True,
             total_bytes=total_bytes,
             best_connections=best.connections,
-            peak_speed_bps=peak_speed,
-            source="probe",
+            peak_speed_bps=max(item.speed_bps for item in usable),
+            source="probe-v2",
+            confidence=confidence,
             measurements=measurements,
         )
-        logger.info("Preflight selected host=%s %s", host, result.summary)
+        logger.info("Preflight V2 selected host=%s %s", host, result.summary)
         return result
 
     def _inspect(self, url: str) -> tuple[bool, int]:
@@ -229,66 +308,209 @@ class RangePreflightProbe:
         url: str,
         total_bytes: int,
         connections: int,
-        chunk_size: int,
+        measure_bytes: int,
     ) -> ProbeMeasurement:
-        ranges = self._make_ranges(total_bytes, connections, chunk_size)
+        span_size = self.WARMUP_BYTES + measure_bytes
+        ranges = self._make_ranges(total_bytes, connections, span_size)
         if not ranges:
-            return ProbeMeasurement(connections, 0, 0, 0.0, success=False)
+            return ProbeMeasurement(
+                connections=connections,
+                speed_bps=0,
+                bytes_downloaded=0,
+                elapsed_seconds=0.0,
+                successful_workers=0,
+                total_workers=connections,
+                errors={"invalid-range": connections},
+            )
 
-        started = time.perf_counter()
-        downloaded = 0
-        success = True
+        release_measurement = threading.Event()
+        ready_lock = threading.Lock()
+        ready_count = [0]
+        results: list[ProbeWorkerResult] = []
+        level_started = time.perf_counter()
 
-        with ThreadPoolExecutor(max_workers=connections, thread_name_prefix="preflight") as pool:
-            futures = [pool.submit(self._fetch_range, url, start, end) for start, end in ranges]
+        def mark_ready() -> None:
+            with ready_lock:
+                ready_count[0] += 1
+                if ready_count[0] >= connections:
+                    release_measurement.set()
+
+        with ThreadPoolExecutor(
+            max_workers=connections,
+            thread_name_prefix="preflight-v2",
+        ) as pool:
+            futures = [
+                pool.submit(
+                    self._probe_worker,
+                    url,
+                    start,
+                    end,
+                    measure_bytes,
+                    release_measurement,
+                    mark_ready,
+                )
+                for start, end in ranges
+            ]
+
+            release_measurement.wait(timeout=self.WARMUP_SYNC_TIMEOUT)
+            release_measurement.set()
+
             for future in as_completed(futures):
                 try:
-                    downloaded += future.result()
+                    results.append(future.result())
                 except Exception as exc:
-                    success = False
-                    logger.debug(
-                        "Range probe worker failed connections=%s error=%s",
-                        connections,
-                        type(exc).__name__,
+                    results.append(
+                        ProbeWorkerResult(
+                            success=False,
+                            error=self._safe_error(exc),
+                        )
                     )
 
-        elapsed = max(0.001, time.perf_counter() - started)
-        speed_bps = int(downloaded / elapsed) if success and downloaded > 0 else 0
+        successful = [item for item in results if item.success and item.speed_bps > 0]
+        failed = [item for item in results if not item.success]
+        errors = Counter(item.error or "unknown-error" for item in failed)
+        retries = sum(item.retries for item in results)
+
+        if successful:
+            median_worker_speed = statistics.median(item.speed_bps for item in successful)
+            speed_bps = int(median_worker_speed * len(successful))
+            measured_bytes = sum(item.measured_bytes for item in successful)
+            elapsed = max(item.elapsed_seconds for item in successful)
+        else:
+            speed_bps = 0
+            measured_bytes = 0
+            elapsed = max(0.001, time.perf_counter() - level_started)
+
         return ProbeMeasurement(
             connections=connections,
             speed_bps=speed_bps,
-            bytes_downloaded=downloaded,
+            bytes_downloaded=measured_bytes,
             elapsed_seconds=elapsed,
-            success=success and downloaded > 0,
+            successful_workers=len(successful),
+            total_workers=connections,
+            retries=retries,
+            errors=dict(errors),
         )
 
-    def _fetch_range(self, url: str, start: int, end: int) -> int:
-        expected = end - start + 1
+    def _probe_worker(
+        self,
+        url: str,
+        start: int,
+        end: int,
+        measure_bytes: int,
+        release_measurement: threading.Event,
+        mark_ready,
+    ) -> ProbeWorkerResult:
+        last_error = "unknown-error"
+        for attempt in range(1, self.MAX_ATTEMPTS_PER_WORKER + 1):
+            try:
+                return self._probe_worker_once(
+                    url=url,
+                    start=start,
+                    end=end,
+                    measure_bytes=measure_bytes,
+                    release_measurement=release_measurement,
+                    mark_ready=mark_ready,
+                    retries=attempt - 1,
+                )
+            except Exception as exc:
+                last_error = self._safe_error(exc)
+                logger.debug(
+                    "Range probe worker attempt failed attempt=%s/%s error=%s",
+                    attempt,
+                    self.MAX_ATTEMPTS_PER_WORKER,
+                    last_error,
+                )
+        return ProbeWorkerResult(
+            success=False,
+            retries=self.MAX_ATTEMPTS_PER_WORKER - 1,
+            error=last_error,
+        )
+
+    def _probe_worker_once(
+        self,
+        url: str,
+        start: int,
+        end: int,
+        measure_bytes: int,
+        release_measurement: threading.Event,
+        mark_ready,
+        retries: int,
+    ) -> ProbeWorkerResult:
         headers = {
             "Range": f"bytes={start}-{end}",
             "Accept-Encoding": "identity",
             "User-Agent": self.USER_AGENT,
         }
-        with requests.get(
-            url,
-            headers=headers,
-            stream=True,
-            allow_redirects=True,
-            timeout=(2.0, 5.0),
-        ) as response:
-            if response.status_code != 206:
-                raise RuntimeError(f"Range request returned HTTP {response.status_code}")
 
-            read = 0
-            for block in response.iter_content(chunk_size=64 * 1024):
-                if not block:
-                    continue
-                read += len(block)
-                if read >= expected:
-                    break
-            if read < expected:
-                raise RuntimeError(f"Short range response: {read}/{expected} bytes")
-            return expected
+        with requests.Session() as session:
+            with session.get(
+                url,
+                headers=headers,
+                stream=True,
+                allow_redirects=True,
+                timeout=(2.0, 6.0),
+            ) as response:
+                if response.status_code != 206:
+                    retry_after = response.headers.get("Retry-After")
+                    suffix = f" retry-after={retry_after}" if retry_after else ""
+                    raise RuntimeError(f"HTTP {response.status_code}{suffix}")
+
+                warmup_remaining = self.WARMUP_BYTES
+                measured = 0
+                measuring = False
+                measurement_started = 0.0
+                ready_announced = False
+
+                for block in response.iter_content(chunk_size=64 * 1024):
+                    if not block:
+                        continue
+
+                    if warmup_remaining > 0:
+                        consumed = min(len(block), warmup_remaining)
+                        warmup_remaining -= consumed
+                        block = block[consumed:]
+                        if warmup_remaining == 0 and not ready_announced:
+                            mark_ready()
+                            ready_announced = True
+                            release_measurement.wait(timeout=self.WARMUP_SYNC_TIMEOUT + 1.0)
+                            measuring = True
+                            measurement_started = time.perf_counter()
+
+                    if measuring and block:
+                        measured += len(block)
+
+                    if measuring:
+                        elapsed = time.perf_counter() - measurement_started
+                        if measured >= measure_bytes or elapsed >= self.MEASURE_SECONDS:
+                            break
+
+                if warmup_remaining > 0:
+                    raise RuntimeError(
+                        f"short warm-up response ({self.WARMUP_BYTES - warmup_remaining}/{self.WARMUP_BYTES} bytes)"
+                    )
+                if measured <= 0:
+                    raise RuntimeError("no steady-state bytes measured")
+
+                elapsed = max(0.001, time.perf_counter() - measurement_started)
+                return ProbeWorkerResult(
+                    success=True,
+                    measured_bytes=measured,
+                    elapsed_seconds=elapsed,
+                    retries=retries,
+                )
+
+    @classmethod
+    def _confidence(
+        cls,
+        best: ProbeMeasurement,
+        usable: list[ProbeMeasurement],
+    ) -> str:
+        if best.success_ratio >= cls.HIGH_SUCCESS_RATIO and len(usable) >= 3:
+            return "high"
+        if best.success_ratio >= cls.MIN_SUCCESS_RATIO and len(usable) >= 2:
+            return "medium"
+        return "low"
 
     @classmethod
     def _levels_for_size(cls, total_bytes: int) -> tuple[int, ...]:
@@ -304,24 +526,28 @@ class RangePreflightProbe:
         return cls.CONNECTION_LEVELS
 
     @staticmethod
-    def _chunk_size(total_bytes: int) -> int:
+    def _measure_bytes_per_worker(connections: int) -> int:
         mib = 1024 * 1024
-        if total_bytes >= 1024 * mib:
-            return 1 * mib
-        if total_bytes >= 256 * mib:
-            return 768 * 1024
-        return 512 * 1024
+        if connections <= 1:
+            return 4 * mib
+        if connections == 2:
+            return 3 * mib
+        if connections == 4:
+            return 2 * mib
+        if connections == 8:
+            return 1536 * 1024
+        return 1 * mib
 
     @staticmethod
     def _make_ranges(
         total_bytes: int,
         connections: int,
-        chunk_size: int,
+        span_size: int,
     ) -> list[tuple[int, int]]:
-        if total_bytes <= 0:
+        if total_bytes <= 0 or connections <= 0:
             return []
-        chunk_size = min(chunk_size, max(1, total_bytes // connections))
-        max_start = max(0, total_bytes - chunk_size)
+        span_size = min(span_size, max(1, total_bytes // connections))
+        max_start = max(0, total_bytes - span_size)
         if connections == 1:
             starts = [0]
         else:
@@ -330,6 +556,15 @@ class RangePreflightProbe:
                 for index in range(connections)
             ]
         return [
-            (start, min(total_bytes - 1, start + chunk_size - 1))
+            (start, min(total_bytes - 1, start + span_size - 1))
             for start in starts
         ]
+
+    @staticmethod
+    def _safe_error(exc: Exception) -> str:
+        text = str(exc).strip().replace("\n", " ")
+        if not text:
+            return type(exc).__name__
+        if "http" in text.lower() and "://" in text:
+            return type(exc).__name__
+        return text[:160]
