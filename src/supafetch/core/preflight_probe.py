@@ -24,6 +24,7 @@ class ProbeWorkerResult:
     elapsed_seconds: float = 0.0
     retries: int = 0
     error: str = ""
+    rate_limit_hits: int = 0
 
     @property
     def speed_bps(self) -> int:
@@ -42,6 +43,7 @@ class ProbeMeasurement:
     total_workers: int
     retries: int = 0
     errors: dict[str, int] = field(default_factory=dict)
+    rate_limit_hits: int = 0
 
     @property
     def success_ratio(self) -> float:
@@ -66,6 +68,12 @@ class ProbeMeasurement:
             and self.success_ratio >= RangePreflightProbe.MIN_SUCCESS_RATIO
         )
 
+    @property
+    def rate_limited(self) -> bool:
+        if self.rate_limit_hits > 0:
+            return True
+        return any(name.startswith("HTTP 429") for name in self.errors)
+
 
 @dataclass(slots=True)
 class PreflightResult:
@@ -78,23 +86,40 @@ class PreflightResult:
     confidence: str = "low"
     measurements: list[ProbeMeasurement] = field(default_factory=list)
     note: str = ""
+    rate_limit_detected: bool = False
+    safe_connection_ceiling: int = 16
 
     @property
     def summary(self) -> str:
         if not self.measurements:
+            suffix = (
+                f"; rate-limit-cap={self.safe_connection_ceiling}c"
+                if self.rate_limit_detected
+                else ""
+            )
             return (
                 f"{self.source}: {self.best_connections} connection(s) "
-                f"[{self.confidence}]"
+                f"[{self.confidence}{suffix}]"
             )
+
         points = ", ".join(
             (
                 f"{item.connections}c={item.speed_bps / (1024 * 1024):.2f}MB/s"
                 f"@{item.success_ratio * 100:.0f}%"
+                + (f"/429x{item.rate_limit_hits}" if item.rate_limit_hits else "")
             )
             for item in self.measurements
             if item.speed_bps > 0
         )
-        return f"{points} -> {self.best_connections}c [{self.confidence}]"
+        suffix = (
+            f"; rate-limit-cap={self.safe_connection_ceiling}c"
+            if self.rate_limit_detected
+            else ""
+        )
+        return (
+            f"{points} -> {self.best_connections}c "
+            f"[{self.confidence}{suffix}]"
+        )
 
 
 class RangePreflightProbe:
@@ -147,6 +172,7 @@ class RangePreflightProbe:
                 best_connections=1,
                 source="no-range",
                 confidence="high",
+                safe_connection_ceiling=1,
             )
 
         levels = self._levels_for_size(total_bytes)
@@ -198,6 +224,8 @@ class RangePreflightProbe:
                     f"{name} x{count}"
                     for name, count in sorted(measurement.errors.items())
                 )
+            if measurement.rate_limit_hits:
+                error_text += f" rate_limit_hits={measurement.rate_limit_hits}"
 
             logger.info(
                 "Preflight V2 result host=%s connections=%s speed=%.2fMB/s effective=%.2fMB/s success=%s/%s(%.0f%%) retries=%s elapsed=%.3fs efficiency=%.2fMB/s/conn%s",
@@ -268,6 +296,8 @@ class RangePreflightProbe:
                 confidence="low",
                 measurements=measurements,
                 note="No reliable steady-state throughput samples",
+                rate_limit_detected=any(item.rate_limited for item in measurements),
+                safe_connection_ceiling=self._rate_limit_ceiling(measurements),
             )
 
         peak_effective = max(item.effective_speed_bps for item in usable)
@@ -278,6 +308,9 @@ class RangePreflightProbe:
         ]
         best = min(near_peak, key=lambda item: item.connections)
         confidence = self._confidence(best, usable)
+        rate_limit_detected = any(item.rate_limited for item in measurements)
+        safe_ceiling = self._rate_limit_ceiling(measurements)
+
         result = PreflightResult(
             host=host,
             range_supported=True,
@@ -287,7 +320,15 @@ class RangePreflightProbe:
             source="probe-v2",
             confidence=confidence,
             measurements=measurements,
+            rate_limit_detected=rate_limit_detected,
+            safe_connection_ceiling=safe_ceiling,
         )
+        if rate_limit_detected:
+            logger.warning(
+                "Preflight detected rate limiting host=%s safe_connection_ceiling=%sc",
+                host,
+                safe_ceiling,
+            )
         logger.info("Preflight V2 selected host=%s %s", host, result.summary)
         return result
 
@@ -382,12 +423,11 @@ class RangePreflightProbe:
                         )
                     )
 
-        successful = [
-            item for item in results if item.success and item.speed_bps > 0
-        ]
+        successful = [item for item in results if item.success and item.speed_bps > 0]
         failed = [item for item in results if not item.success]
         errors = Counter(item.error or "unknown-error" for item in failed)
         retries = sum(item.retries for item in results)
+        rate_limit_hits = sum(item.rate_limit_hits for item in results)
 
         if successful:
             median_worker_speed = statistics.median(
@@ -410,6 +450,7 @@ class RangePreflightProbe:
             total_workers=connections,
             retries=retries,
             errors=dict(errors),
+            rate_limit_hits=rate_limit_hits,
         )
 
     def _probe_worker(
@@ -422,19 +463,33 @@ class RangePreflightProbe:
         mark_ready,
     ) -> ProbeWorkerResult:
         last_error = "unknown-error"
+        rate_limit_hits = 0
+        ready_announced = False
+
+        def mark_ready_once() -> None:
+            nonlocal ready_announced
+            if ready_announced:
+                return
+            ready_announced = True
+            mark_ready()
+
         for attempt in range(1, self.MAX_ATTEMPTS_PER_WORKER + 1):
             try:
-                return self._probe_worker_once(
+                result = self._probe_worker_once(
                     url=url,
                     start=start,
                     end=end,
                     measure_bytes=measure_bytes,
                     release_measurement=release_measurement,
-                    mark_ready=mark_ready,
+                    mark_ready=mark_ready_once,
                     retries=attempt - 1,
                 )
+                result.rate_limit_hits = rate_limit_hits
+                return result
             except Exception as exc:
                 last_error = self._safe_error(exc)
+                if last_error.startswith("HTTP 429"):
+                    rate_limit_hits += 1
                 logger.debug(
                     "Range probe worker attempt failed attempt=%s/%s error=%s",
                     attempt,
@@ -443,10 +498,12 @@ class RangePreflightProbe:
                 )
                 if attempt < self.MAX_ATTEMPTS_PER_WORKER:
                     time.sleep(0.2 * attempt)
+
         return ProbeWorkerResult(
             success=False,
             retries=self.MAX_ATTEMPTS_PER_WORKER - 1,
             error=last_error,
+            rate_limit_hits=rate_limit_hits,
         )
 
     def _probe_worker_once(
@@ -482,7 +539,6 @@ class RangePreflightProbe:
                 measured = 0
                 measuring = False
                 measurement_started = 0.0
-                ready_announced = False
 
                 for block in response.iter_content(chunk_size=64 * 1024):
                     if not block:
@@ -492,9 +548,8 @@ class RangePreflightProbe:
                         consumed = min(len(block), warmup_remaining)
                         warmup_remaining -= consumed
                         block = block[consumed:]
-                        if warmup_remaining == 0 and not ready_announced:
+                        if warmup_remaining == 0:
                             mark_ready()
-                            ready_announced = True
                             release_measurement.wait(
                                 timeout=self.WARMUP_SYNC_TIMEOUT + 1.0
                             )
@@ -506,10 +561,7 @@ class RangePreflightProbe:
 
                     if measuring:
                         elapsed = time.perf_counter() - measurement_started
-                        if (
-                            measured >= measure_bytes
-                            or elapsed >= self.MEASURE_SECONDS
-                        ):
+                        if measured >= measure_bytes or elapsed >= self.MEASURE_SECONDS:
                             break
 
                 if warmup_remaining > 0:
@@ -521,10 +573,7 @@ class RangePreflightProbe:
                 if measured <= 0:
                     raise RuntimeError("no steady-state bytes measured")
 
-                elapsed = max(
-                    0.001,
-                    time.perf_counter() - measurement_started,
-                )
+                elapsed = max(0.001, time.perf_counter() - measurement_started)
                 return ProbeWorkerResult(
                     success=True,
                     measured_bytes=measured,
@@ -538,15 +587,9 @@ class RangePreflightProbe:
         best: ProbeMeasurement,
         usable: list[ProbeMeasurement],
     ) -> str:
-        if (
-            best.success_ratio >= cls.HIGH_SUCCESS_RATIO
-            and len(usable) >= 3
-        ):
+        if best.success_ratio >= cls.HIGH_SUCCESS_RATIO and len(usable) >= 3:
             return "high"
-        if (
-            best.success_ratio >= cls.MIN_SUCCESS_RATIO
-            and len(usable) >= 2
-        ):
+        if best.success_ratio >= cls.MIN_SUCCESS_RATIO and len(usable) >= 2:
             return "medium"
         return "low"
 
@@ -597,6 +640,13 @@ class RangePreflightProbe:
             (start, min(total_bytes - 1, start + span_size - 1))
             for start in starts
         ]
+
+    @classmethod
+    def _rate_limit_ceiling(cls, measurements: list[ProbeMeasurement]) -> int:
+        limited = [item.connections for item in measurements if item.rate_limited]
+        if not limited:
+            return cls.CONNECTION_LEVELS[-1]
+        return max(1, min(cls.CONNECTION_LEVELS[-1], min(limited)))
 
     @staticmethod
     def _safe_error(exc: Exception) -> str:
