@@ -88,7 +88,7 @@ class HostProfileStore:
 class AdaptiveState:
     host: str
     connections: int
-    samples: deque[int] = field(default_factory=lambda: deque(maxlen=8))
+    samples: deque[int] = field(default_factory=lambda: deque(maxlen=12))
     phase: str = "warming"
     baseline_speed_bps: int = 0
     previous_connections: int = 2
@@ -107,8 +107,10 @@ class AdaptiveState:
 
 class PerformanceOptimizer:
     CONNECTION_LEVELS = (2, 4, 8, 16)
-    WARMUP_SECONDS = 5.0
-    EVALUATION_SECONDS = 6.0
+    # aria2 restarts an active transfer internally when split/connection options
+    # change, so probes must be long enough to amortize reconnection overhead.
+    WARMUP_SECONDS = 8.0
+    EVALUATION_SECONDS = 10.0
     MIN_IMPROVEMENT = 0.10
 
     def __init__(self) -> None:
@@ -179,9 +181,7 @@ class PerformanceOptimizer:
         now = time.monotonic()
         elapsed = now - state.last_decision_at
 
-        # If a transfer that already made progress stalls at higher concurrency,
-        # reduce pressure on the server and remember the lower ceiling.
-        if completed_bytes > 0 and state.zero_samples >= 4 and state.connections > 2:
+        if completed_bytes > 0 and state.zero_samples >= 6 and state.connections > 2:
             old_connections = state.connections
             target = self._previous_level(old_connections)
             state.max_connections = min(state.max_connections, target)
@@ -194,7 +194,7 @@ class PerformanceOptimizer:
             )
             return average, target, "fallback"
 
-        if len(state.samples) < 5 or elapsed < self.WARMUP_SECONDS:
+        if len(state.samples) < 8 or elapsed < self.WARMUP_SECONDS:
             return average, None, state.phase
 
         if state.phase in {"warming", "stable", "settling"}:
@@ -227,7 +227,7 @@ class PerformanceOptimizer:
             )
             return average, target, "probing"
 
-        if state.phase == "probing" and elapsed >= self.EVALUATION_SECONDS and len(state.samples) >= 5:
+        if state.phase == "probing" and elapsed >= self.EVALUATION_SECONDS and len(state.samples) >= 8:
             candidate_speed = max(1, average)
             ratio = candidate_speed / max(1, state.baseline_speed_bps)
             if ratio >= 1.0 + self.MIN_IMPROVEMENT:
