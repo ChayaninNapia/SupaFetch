@@ -68,6 +68,16 @@ class Aria2Service:
             "--split=2",
             "--min-split-size=1M",
             "--file-allocation=none",
+            # HTTP/runtime tuning. Keep-alive is explicit so every managed aria2
+            # process uses the same profile; the larger memory/socket buffers
+            # reduce small write/receive overhead without changing file data.
+            "--enable-http-keep-alive=true",
+            "--disk-cache=64M",
+            "--socket-recv-buffer-size=1M",
+            "--connect-timeout=10",
+            "--timeout=30",
+            "--max-tries=5",
+            "--retry-wait=1",
             "--summary-interval=0",
             "--console-log-level=info",
             "--log-level=debug",
