@@ -10,13 +10,23 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+class Aria2RpcTimeout(RuntimeError):
+    """Raised when the local aria2 RPC endpoint is temporarily unresponsive."""
+
+
 class Aria2Client:
     def __init__(self, rpc_url: str, secret: str) -> None:
         self.rpc_url = rpc_url
         self.secret = secret
         self._request_id = 0
+        self._session = requests.Session()
 
-    def _call(self, method: str, *params: Any) -> Any:
+    def _call(
+        self,
+        method: str,
+        *params: Any,
+        timeout: float | tuple[float, float] = 5.0,
+    ) -> Any:
         self._request_id += 1
         request_id = str(self._request_id)
         payload = {
@@ -27,9 +37,17 @@ class Aria2Client:
         }
         logger.debug("RPC -> %s id=%s", method, request_id)
         try:
-            response = requests.post(self.rpc_url, json=payload, timeout=5)
+            response = self._session.post(self.rpc_url, json=payload, timeout=timeout)
             response.raise_for_status()
             data = response.json()
+        except requests.Timeout as exc:
+            logger.warning(
+                "RPC timeout: %s id=%s timeout=%s (aria2 may be reconnecting the transfer)",
+                method,
+                request_id,
+                timeout,
+            )
+            raise Aria2RpcTimeout(f"aria2 RPC timed out while calling {method}") from exc
         except requests.RequestException:
             logger.exception("RPC transport failure: %s id=%s", method, request_id)
             raise
@@ -65,7 +83,7 @@ class Aria2Client:
 
     def change_option(self, gid: str, options: dict[str, str]) -> str:
         logger.info("Changing download options gid=%s options=%s", gid, options)
-        return self._call("aria2.changeOption", gid, options)
+        return self._call("aria2.changeOption", gid, options, timeout=(0.5, 6.0))
 
     def pause(self, gid: str) -> str:
         logger.info("Pause requested gid=%s", gid)
@@ -94,7 +112,9 @@ class Aria2Client:
             "errorCode",
             "errorMessage",
         ]
-        return self._call("aria2.tellStatus", gid, keys)
+        # Status polling is best-effort. A short timeout keeps a temporarily busy
+        # aria2 engine from freezing the desktop UI.
+        return self._call("aria2.tellStatus", gid, keys, timeout=(0.35, 1.5))
 
     def tell_active(self) -> list[dict[str, Any]]:
         return self._call("aria2.tellActive")
