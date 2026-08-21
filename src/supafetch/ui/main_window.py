@@ -26,15 +26,26 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.manager = manager
         self.setWindowTitle("SupaFetch")
-        self.resize(980, 520)
+        self.resize(1180, 540)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
-            ["File", "Progress", "Downloaded", "Speed", "ETA", "Status", "GID"]
+            [
+                "File",
+                "Progress",
+                "Downloaded",
+                "Speed",
+                "Avg Speed",
+                "Conn",
+                "ETA",
+                "Adaptive",
+                "Status",
+                "GID",
+            ]
         )
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
 
@@ -86,7 +97,7 @@ class MainWindow(QMainWindow):
         row = self.table.currentRow()
         if row < 0:
             return None
-        item = self.table.item(row, 6)
+        item = self.table.item(row, 9)
         return item.text() if item else None
 
     def pause_selected(self) -> None:
@@ -142,9 +153,12 @@ class MainWindow(QMainWindow):
             0: download.name,
             2: f"{format_bytes(download.completed_bytes)} / {format_bytes(download.total_bytes)}",
             3: format_speed(download.speed_bps),
-            4: eta,
-            5: download.status,
-            6: download.gid,
+            4: format_speed(download.average_speed_bps),
+            5: str(download.connections),
+            6: eta,
+            7: download.adaptive_mode,
+            8: download.status,
+            9: download.gid,
         }
         for column, value in values.items():
             self.table.setItem(row, column, QTableWidgetItem(value))
@@ -155,8 +169,10 @@ class MainWindow(QMainWindow):
             return "Done"
         if download.status == "paused":
             return "Paused"
-        if download.speed_bps <= 0 or download.total_bytes <= 0:
+
+        eta_speed = download.average_speed_bps or download.speed_bps
+        if eta_speed <= 0 or download.total_bytes <= 0:
             return "--"
 
         remaining_bytes = max(0, download.total_bytes - download.completed_bytes)
-        return format_duration(remaining_bytes / download.speed_bps)
+        return format_duration(remaining_bytes / eta_speed)
