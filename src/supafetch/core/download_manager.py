@@ -41,10 +41,6 @@ class DownloadManager:
             directory = str(Path(directory).expanduser().resolve())
 
         host = (parsed.hostname or "unknown").lower()
-
-        # A second download from the same CDN would contaminate a fresh range
-        # benchmark because both transfers compete for the same host/network.
-        # Reuse the learned profile and let Phase 3 validate the real transfer.
         with self._lock:
             same_host_active = self._active_host_count(host)
 
@@ -58,7 +54,7 @@ class DownloadManager:
                 f"skipped: {same_host_active} active transfer(s) already use {host}"
             )
             logger.info(
-                "Preflight skipped host=%s active_same_host=%s profile_connections=%s confidence=%s expected=%.2fMB/s",
+                "Preflight skipped host=%s active_same_host=%s profile_configured=%s confidence=%s expected=%.2fMB/s",
                 host,
                 same_host_active,
                 selected_connections,
@@ -75,7 +71,7 @@ class DownloadManager:
                 confidence = self.optimizer.fallback_confidence(host)
                 expected_speed = self.optimizer.expected_speed(host)
                 logger.warning(
-                    "Preflight unavailable host=%s; falling back to %s connection(s) confidence=%s",
+                    "Preflight unavailable host=%s; falling back to configured=%s confidence=%s",
                     host,
                     selected_connections,
                     confidence,
@@ -92,7 +88,7 @@ class DownloadManager:
 
         options = self._download_options(selected_connections, total_bytes)
         logger.info(
-            "Starting download host=%s strategy=%s connections=%s confidence=%s expected=%.2fMB/s total=%s benchmark=%s",
+            "Starting download host=%s strategy=%s configured=%s confidence=%s expected=%.2fMB/s total=%s benchmark=%s",
             host,
             strategy,
             selected_connections,
@@ -173,7 +169,11 @@ class DownloadManager:
                     ):
                         same_host_active += 1
                         active_by_host[host] = same_host_active
-                    same_host_active = max(1, same_host_active) if download.status == "active" else 0
+                    same_host_active = (
+                        max(1, same_host_active)
+                        if download.status == "active"
+                        else 0
+                    )
 
                     decision = self.optimizer.observe(
                         gid=gid,
@@ -184,45 +184,59 @@ class DownloadManager:
                         observed_connections=download.connections,
                         same_host_active=same_host_active,
                     )
-                    download.average_speed_bps = decision.stable_10_bps or download.speed_bps
+                    download.average_speed_bps = (
+                        decision.stable_10_bps or download.speed_bps
+                    )
                     download.stable_10_bps = decision.stable_10_bps
                     download.stable_30_bps = decision.stable_30_bps
                     download.peak_speed_bps = decision.peak_speed_bps
                     download.expected_speed_bps = decision.expected_speed_bps
+                    download.configured_connections = decision.configured_connections
+                    download.safe_connection_ceiling = decision.safe_connection_ceiling
+                    download.rate_limit_risk = decision.rate_limit_risk
                     download.adaptive_mode = decision.mode
 
-                    if decision.target_connections is not None and download.status == "active":
+                    if (
+                        decision.target_connections is not None
+                        and download.status == "active"
+                    ):
                         target = decision.target_connections
                         options = self._download_options(target, download.total_bytes)
                         try:
                             self.client.change_option(gid, options)
                             self._poll_suppressed_until[gid] = (
-                                time.monotonic() + self.CONNECTION_CHANGE_GRACE_SECONDS
+                                time.monotonic()
+                                + self.CONNECTION_CHANGE_GRACE_SECONDS
                             )
-                            download.connections = target
+                            # Do not overwrite download.connections here. That
+                            # value is the actual count reported by aria2. The
+                            # target is only the configured ceiling.
+                            download.configured_connections = target
                             download.adaptive_mode = "reconnecting"
                             logger.info(
-                                "Runtime connection change applied gid=%s target=%s min_split=%s grace=%.1fs decision=%s",
+                                "Runtime connection ceiling change applied gid=%s configured_target=%s active_before=%s min_split=%s grace=%.1fs decision=%s",
                                 gid,
                                 target,
+                                download.connections,
                                 options["min-split-size"],
                                 self.CONNECTION_CHANGE_GRACE_SECONDS,
                                 decision.mode,
                             )
                         except Aria2RpcTimeout:
                             self._poll_suppressed_until[gid] = (
-                                time.monotonic() + self.CONNECTION_CHANGE_GRACE_SECONDS
+                                time.monotonic()
+                                + self.CONNECTION_CHANGE_GRACE_SECONDS
                             )
-                            download.connections = target
+                            download.configured_connections = target
                             download.adaptive_mode = "reconnecting"
                             logger.warning(
-                                "Runtime connection change response timed out gid=%s target=%s; treating as pending",
+                                "Runtime connection ceiling response timed out gid=%s configured_target=%s; treating as pending",
                                 gid,
                                 target,
                             )
                         except Exception:
                             logger.exception(
-                                "Runtime connection change failed gid=%s target=%s",
+                                "Runtime connection ceiling change failed gid=%s configured_target=%s",
                                 gid,
                                 target,
                             )
@@ -235,7 +249,7 @@ class DownloadManager:
                     previous = self._last_status.get(gid)
                     if download.status != previous:
                         logger.info(
-                            "Status gid=%s %s -> %s downloaded=%s/%s speed=%sB/s stable10=%sB/s stable30=%sB/s connections=%s optimizer=%s errorCode=%s error=%r",
+                            "Status gid=%s %s -> %s downloaded=%s/%s speed=%sB/s stable10=%sB/s stable30=%sB/s active_conn=%s configured_conn=%s safe_ceiling=%s rate_limit_risk=%s optimizer=%s errorCode=%s error=%r",
                             gid,
                             previous or "unknown",
                             download.status,
@@ -245,6 +259,9 @@ class DownloadManager:
                             decision.stable_10_bps,
                             decision.stable_30_bps,
                             payload.get("connections", "?"),
+                            download.configured_connections,
+                            download.safe_connection_ceiling,
+                            download.rate_limit_risk,
                             download.adaptive_mode,
                             payload.get("errorCode", ""),
                             payload.get("errorMessage", ""),
@@ -277,7 +294,10 @@ class DownloadManager:
                             )
                         )
                 except Exception:
-                    logger.exception("Could not refresh gid=%s; keeping cached state", gid)
+                    logger.exception(
+                        "Could not refresh gid=%s; keeping cached state",
+                        gid,
+                    )
                     if cached is not None:
                         downloads.append(
                             replace(
@@ -302,12 +322,18 @@ class DownloadManager:
         selected_connections: int,
     ) -> int:
         for measurement in result.measurements:
-            if measurement.connections == selected_connections and measurement.usable:
+            if (
+                measurement.connections == selected_connections
+                and measurement.usable
+            ):
                 return measurement.effective_speed_bps
         return max(0, result.peak_speed_bps)
 
     @staticmethod
-    def _download_options(connections: int, total_bytes: int) -> dict[str, str]:
+    def _download_options(
+        connections: int,
+        total_bytes: int,
+    ) -> dict[str, str]:
         if total_bytes >= 1024 * 1024 * 1024:
             min_split_size = "8M"
         elif total_bytes >= 256 * 1024 * 1024:
