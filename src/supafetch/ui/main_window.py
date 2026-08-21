@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.manager = manager
         self.setWindowTitle("SupaFetch")
-        self.resize(1480, 560)
+        self.resize(1500, 560)
 
         self.table = QTableWidget(0, 13)
         self.table.setHorizontalHeaderLabels(
@@ -76,7 +76,7 @@ class MainWindow(QMainWindow):
                 "Stable 30s",
                 "Peak",
                 "Expected",
-                "Conn",
+                "Active / Config",
                 "ETA",
                 "Optimizer",
                 "Status",
@@ -238,6 +238,11 @@ class MainWindow(QMainWindow):
         self.table.setCellWidget(row, 1, progress)
 
         eta = self._format_eta(download)
+        configured = download.configured_connections or download.connections
+        connection_text = f"{download.connections} / {configured}"
+        if download.rate_limit_risk:
+            connection_text += f" (cap {download.safe_connection_ceiling})"
+
         values = {
             0: download.name,
             2: f"{format_bytes(download.completed_bytes)} / {format_bytes(download.total_bytes)}",
@@ -246,7 +251,7 @@ class MainWindow(QMainWindow):
             5: format_speed(download.stable_30_bps),
             6: format_speed(download.peak_speed_bps),
             7: format_speed(download.expected_speed_bps),
-            8: str(download.connections),
+            8: connection_text,
             9: eta,
             10: download.adaptive_mode,
             11: download.status,
