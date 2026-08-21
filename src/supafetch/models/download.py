@@ -15,6 +15,10 @@ class Download:
     speed_bps: int
     connections: int = 0
     average_speed_bps: int = 0
+    stable_10_bps: int = 0
+    stable_30_bps: int = 0
+    peak_speed_bps: int = 0
+    expected_speed_bps: int = 0
     adaptive_mode: str = "warming"
     error_message: str = ""
 
