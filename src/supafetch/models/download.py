@@ -13,6 +13,9 @@ class Download:
     total_bytes: int
     completed_bytes: int
     speed_bps: int
+    connections: int = 0
+    average_speed_bps: int = 0
+    adaptive_mode: str = "warming"
     error_message: str = ""
 
     @property
@@ -33,5 +36,6 @@ class Download:
             total_bytes=int(payload.get("totalLength", 0)),
             completed_bytes=int(payload.get("completedLength", 0)),
             speed_bps=int(payload.get("downloadSpeed", 0)),
+            connections=int(payload.get("connections", 0)),
             error_message=payload.get("errorMessage", ""),
         )
