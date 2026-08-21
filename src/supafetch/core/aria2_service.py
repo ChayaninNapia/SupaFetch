@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import requests
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -14,6 +19,7 @@ class Aria2Service:
     port: int = 6800
     secret: str = "supafetch-local"
     process: subprocess.Popen | None = None
+    log_handle: object | None = None
 
     @property
     def rpc_url(self) -> str:
@@ -37,6 +43,7 @@ class Aria2Service:
 
     def start(self) -> None:
         if self.is_running():
+            logger.info("Using existing aria2 RPC at %s", self.rpc_url)
             return
 
         executable = shutil.which("aria2c")
@@ -44,6 +51,11 @@ class Aria2Service:
             raise RuntimeError(
                 "aria2c was not found in PATH. Install aria2 and restart SupaFetch."
             )
+
+        log_path = Path.cwd() / "supafetch-aria2.log"
+        self.log_handle = log_path.open("a", encoding="utf-8")
+        logger.info("Starting aria2c: %s", executable)
+        logger.info("aria2 process log: %s", log_path)
 
         command = [
             executable,
@@ -57,6 +69,9 @@ class Aria2Service:
             "--min-split-size=1M",
             "--file-allocation=none",
             "--summary-interval=0",
+            "--console-log-level=info",
+            "--log-level=debug",
+            "--log=-",
         ]
 
         creationflags = 0
@@ -65,14 +80,15 @@ class Aria2Service:
 
         self.process = subprocess.Popen(
             command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self.log_handle,
+            stderr=subprocess.STDOUT,
             creationflags=creationflags,
         )
 
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if self.is_running():
+                logger.info("aria2 RPC ready at %s", self.rpc_url)
                 return
             time.sleep(0.1)
 
@@ -81,9 +97,17 @@ class Aria2Service:
 
     def stop(self) -> None:
         if self.process and self.process.poll() is None:
+            logger.info("Stopping aria2c")
             self.process.terminate()
             try:
                 self.process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 self.process.kill()
         self.process = None
+
+        if self.log_handle:
+            try:
+                self.log_handle.close()
+            except Exception:
+                pass
+            self.log_handle = None
