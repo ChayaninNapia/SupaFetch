@@ -204,6 +204,48 @@ class HostProfileStore:
                             ),
                         }
 
+                if (
+                    runtime_best > 0
+                    and runtime_speed > 0
+                    and str(runtime_best)
+                    not in config_stats
+                ):
+                    config_stats[str(runtime_best)] = {
+                        "best_speed_bps": runtime_speed,
+                        "last_speed_bps": runtime_speed,
+                        "samples": 1,
+                        "observed_typical": max(
+                            0,
+                            min(
+                                16,
+                                int(
+                                    values.get(
+                                        "best_observed_connections",
+                                        0,
+                                    )
+                                ),
+                            ),
+                        ),
+                        "observed_peak": max(
+                            0,
+                            min(
+                                16,
+                                int(
+                                    values.get(
+                                        "max_observed_connections",
+                                        0,
+                                    )
+                                ),
+                            ),
+                        ),
+                        "updated_epoch": float(
+                            values.get(
+                                "last_runtime_epoch",
+                                0.0,
+                            )
+                        ),
+                    }
+
                 profile = HostProfile(
                     probe_best_connections=min(
                         probe_best,
