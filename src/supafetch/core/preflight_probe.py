@@ -61,7 +61,10 @@ class ProbeMeasurement:
 
     @property
     def usable(self) -> bool:
-        return self.speed_bps > 0 and self.success_ratio >= RangePreflightProbe.MIN_SUCCESS_RATIO
+        return (
+            self.speed_bps > 0
+            and self.success_ratio >= RangePreflightProbe.MIN_SUCCESS_RATIO
+        )
 
 
 @dataclass(slots=True)
@@ -79,7 +82,10 @@ class PreflightResult:
     @property
     def summary(self) -> str:
         if not self.measurements:
-            return f"{self.source}: {self.best_connections} connection(s) [{self.confidence}]"
+            return (
+                f"{self.source}: {self.best_connections} connection(s) "
+                f"[{self.confidence}]"
+            )
         points = ", ".join(
             (
                 f"{item.connections}c={item.speed_bps / (1024 * 1024):.2f}MB/s"
@@ -92,13 +98,7 @@ class PreflightResult:
 
 
 class RangePreflightProbe:
-    """Preflight V2: estimate steady HTTP Range scalability before aria2 starts.
-
-    Each worker opens one ranged response, consumes a small warm-up portion to
-    get past connection startup effects, then measures only steady-state bytes.
-    A failed worker is retried once and contributes to a reliability score
-    instead of making the whole concurrency level fail immediately.
-    """
+    """Estimate steady HTTP Range scalability before aria2 starts."""
 
     CONNECTION_LEVELS = (1, 2, 4, 8, 16)
     MIN_IMPROVEMENT = 0.08
@@ -108,8 +108,10 @@ class RangePreflightProbe:
     WARMUP_BYTES = 256 * 1024
     MEASURE_SECONDS = 2.0
     WARMUP_SYNC_TIMEOUT = 4.0
-    MAX_PROBE_SECONDS = 28.0
+    MAX_PROBE_SECONDS = 36.0
     MAX_ATTEMPTS_PER_WORKER = 2
+    LARGE_FILE_BYTES = 1024 * 1024 * 1024
+    LARGE_FILE_MIN_PROBE_CONNECTIONS = 8
     USER_AGENT = "SupaFetch/0.1"
 
     def run(self, url: str) -> PreflightResult:
@@ -119,9 +121,8 @@ class RangePreflightProbe:
             range_supported, total_bytes = self._inspect(url)
         except Exception as exc:
             logger.warning(
-                "Preflight inspection failed host=%s error=%s: %s",
+                "Preflight inspection failed host=%s error=%s",
                 host,
-                type(exc).__name__,
                 self._safe_error(exc),
             )
             return PreflightResult(
@@ -135,7 +136,10 @@ class RangePreflightProbe:
             )
 
         if not range_supported:
-            logger.info("Preflight host=%s does not support byte ranges; using 1 connection", host)
+            logger.info(
+                "Preflight host=%s does not support byte ranges; using 1 connection",
+                host,
+            )
             return PreflightResult(
                 host=host,
                 range_supported=False,
@@ -146,22 +150,33 @@ class RangePreflightProbe:
             )
 
         levels = self._levels_for_size(total_bytes)
+        minimum_probe_connections = (
+            self.LARGE_FILE_MIN_PROBE_CONNECTIONS
+            if total_bytes >= self.LARGE_FILE_BYTES
+            else 1
+        )
         measurements: list[ProbeMeasurement] = []
         plateau_count = 0
         previous_effective_speed = 0
 
         logger.info(
-            "Preflight V2 benchmark host=%s total=%s levels=%s warmup=%s measure_window=%.1fs budget=%.0fs",
+            "Preflight V2 benchmark host=%s total=%s levels=%s warmup=%s measure_window=%.1fs budget=%.0fs min_probe=%sc",
             host,
             total_bytes,
             levels,
             self.WARMUP_BYTES,
             self.MEASURE_SECONDS,
             self.MAX_PROBE_SECONDS,
+            minimum_probe_connections,
         )
 
         for connections in levels:
-            if measurements and time.monotonic() - probe_started >= self.MAX_PROBE_SECONDS:
+            elapsed_budget = time.monotonic() - probe_started
+            if (
+                measurements
+                and elapsed_budget >= self.MAX_PROBE_SECONDS
+                and connections > minimum_probe_connections
+            ):
                 logger.info(
                     "Preflight time budget reached host=%s after %s level(s)",
                     host,
@@ -180,7 +195,8 @@ class RangePreflightProbe:
             error_text = ""
             if measurement.errors:
                 error_text = " errors=" + ", ".join(
-                    f"{name} x{count}" for name, count in sorted(measurement.errors.items())
+                    f"{name} x{count}"
+                    for name, count in sorted(measurement.errors.items())
                 )
 
             logger.info(
@@ -233,7 +249,7 @@ class RangePreflightProbe:
                 )
             previous_effective_speed = measurement.effective_speed_bps
 
-            if plateau_count >= 2:
+            if plateau_count >= 2 and connections >= minimum_probe_connections:
                 logger.info(
                     "Preflight saturation detected host=%s at <=%s connections",
                     host,
@@ -366,13 +382,17 @@ class RangePreflightProbe:
                         )
                     )
 
-        successful = [item for item in results if item.success and item.speed_bps > 0]
+        successful = [
+            item for item in results if item.success and item.speed_bps > 0
+        ]
         failed = [item for item in results if not item.success]
         errors = Counter(item.error or "unknown-error" for item in failed)
         retries = sum(item.retries for item in results)
 
         if successful:
-            median_worker_speed = statistics.median(item.speed_bps for item in successful)
+            median_worker_speed = statistics.median(
+                item.speed_bps for item in successful
+            )
             speed_bps = int(median_worker_speed * len(successful))
             measured_bytes = sum(item.measured_bytes for item in successful)
             elapsed = max(item.elapsed_seconds for item in successful)
@@ -421,6 +441,8 @@ class RangePreflightProbe:
                     self.MAX_ATTEMPTS_PER_WORKER,
                     last_error,
                 )
+                if attempt < self.MAX_ATTEMPTS_PER_WORKER:
+                    time.sleep(0.2 * attempt)
         return ProbeWorkerResult(
             success=False,
             retries=self.MAX_ATTEMPTS_PER_WORKER - 1,
@@ -473,7 +495,9 @@ class RangePreflightProbe:
                         if warmup_remaining == 0 and not ready_announced:
                             mark_ready()
                             ready_announced = True
-                            release_measurement.wait(timeout=self.WARMUP_SYNC_TIMEOUT + 1.0)
+                            release_measurement.wait(
+                                timeout=self.WARMUP_SYNC_TIMEOUT + 1.0
+                            )
                             measuring = True
                             measurement_started = time.perf_counter()
 
@@ -482,17 +506,25 @@ class RangePreflightProbe:
 
                     if measuring:
                         elapsed = time.perf_counter() - measurement_started
-                        if measured >= measure_bytes or elapsed >= self.MEASURE_SECONDS:
+                        if (
+                            measured >= measure_bytes
+                            or elapsed >= self.MEASURE_SECONDS
+                        ):
                             break
 
                 if warmup_remaining > 0:
                     raise RuntimeError(
-                        f"short warm-up response ({self.WARMUP_BYTES - warmup_remaining}/{self.WARMUP_BYTES} bytes)"
+                        "short warm-up response "
+                        f"({self.WARMUP_BYTES - warmup_remaining}/"
+                        f"{self.WARMUP_BYTES} bytes)"
                     )
                 if measured <= 0:
                     raise RuntimeError("no steady-state bytes measured")
 
-                elapsed = max(0.001, time.perf_counter() - measurement_started)
+                elapsed = max(
+                    0.001,
+                    time.perf_counter() - measurement_started,
+                )
                 return ProbeWorkerResult(
                     success=True,
                     measured_bytes=measured,
@@ -506,9 +538,15 @@ class RangePreflightProbe:
         best: ProbeMeasurement,
         usable: list[ProbeMeasurement],
     ) -> str:
-        if best.success_ratio >= cls.HIGH_SUCCESS_RATIO and len(usable) >= 3:
+        if (
+            best.success_ratio >= cls.HIGH_SUCCESS_RATIO
+            and len(usable) >= 3
+        ):
             return "high"
-        if best.success_ratio >= cls.MIN_SUCCESS_RATIO and len(usable) >= 2:
+        if (
+            best.success_ratio >= cls.MIN_SUCCESS_RATIO
+            and len(usable) >= 2
+        ):
             return "medium"
         return "low"
 
@@ -562,9 +600,31 @@ class RangePreflightProbe:
 
     @staticmethod
     def _safe_error(exc: Exception) -> str:
+        if isinstance(exc, requests.exceptions.ConnectTimeout):
+            return "connect-timeout"
+        if isinstance(exc, requests.exceptions.ReadTimeout):
+            return "read-timeout"
+        if isinstance(exc, requests.exceptions.SSLError):
+            return "tls-error"
+        if isinstance(exc, requests.exceptions.ConnectionError):
+            text = str(exc).lower()
+            if "max retries exceeded" in text:
+                return "connection-error/max-retries"
+            if "connection reset" in text:
+                return "connection-reset"
+            return "connection-error"
+        if isinstance(exc, requests.exceptions.HTTPError):
+            response = exc.response
+            if response is not None:
+                return f"HTTP {response.status_code}"
+            return "http-error"
+
         text = str(exc).strip().replace("\n", " ")
-        if not text:
-            return type(exc).__name__
-        if "http" in text.lower() and "://" in text:
-            return type(exc).__name__
-        return text[:160]
+        if isinstance(exc, RuntimeError):
+            if text.startswith("HTTP "):
+                return text[:80]
+            if text.startswith("short warm-up response"):
+                return text[:120]
+            if text == "no steady-state bytes measured":
+                return text
+        return type(exc).__name__
