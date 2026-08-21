@@ -13,7 +13,11 @@ class Download:
     total_bytes: int
     completed_bytes: int
     speed_bps: int
+    # connections is the actual active count reported by aria2.
     connections: int = 0
+    configured_connections: int = 0
+    safe_connection_ceiling: int = 16
+    rate_limit_risk: bool = False
     average_speed_bps: int = 0
     stable_10_bps: int = 0
     stable_30_bps: int = 0
