@@ -27,9 +27,11 @@ from supafetch.utils.formatters import format_bytes, format_duration, format_spe
 logger = logging.getLogger(__name__)
 
 
-class RefreshWorker(QObject):
+class BackgroundWorker(QObject):
     refreshed = Signal(object)
-    failed = Signal(str)
+    refresh_failed = Signal(str)
+    added = Signal(str)
+    add_failed = Signal(str)
 
     def __init__(self, manager: DownloadManager) -> None:
         super().__init__()
@@ -41,11 +43,21 @@ class RefreshWorker(QObject):
             self.refreshed.emit(self.manager.list_downloads())
         except Exception as exc:
             logger.exception("Background download refresh failed")
-            self.failed.emit(str(exc))
+            self.refresh_failed.emit(str(exc))
+
+    @Slot(str, str)
+    def add_download(self, url: str, directory: str) -> None:
+        try:
+            gid = self.manager.add_download(url, directory or None)
+            self.added.emit(gid)
+        except Exception as exc:
+            logger.exception("Background add download failed")
+            self.add_failed.emit(str(exc))
 
 
 class MainWindow(QMainWindow):
     refresh_requested = Signal()
+    add_requested = Signal(str, str)
 
     def __init__(self, manager: DownloadManager) -> None:
         super().__init__()
@@ -63,7 +75,7 @@ class MainWindow(QMainWindow):
                 "Avg Speed",
                 "Conn",
                 "ETA",
-                "Adaptive",
+                "Optimizer",
                 "Status",
                 "GID",
             ]
@@ -74,18 +86,18 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
 
-        add_button = QPushButton("Add URL")
+        self.add_button = QPushButton("Add URL")
         pause_button = QPushButton("Pause")
         resume_button = QPushButton("Resume")
         remove_button = QPushButton("Remove")
 
-        add_button.clicked.connect(self.add_download)
+        self.add_button.clicked.connect(self.add_download)
         pause_button.clicked.connect(self.pause_selected)
         resume_button.clicked.connect(self.resume_selected)
         remove_button.clicked.connect(self.remove_selected)
 
         controls = QHBoxLayout()
-        controls.addWidget(add_button)
+        controls.addWidget(self.add_button)
         controls.addWidget(pause_button)
         controls.addWidget(resume_button)
         controls.addWidget(remove_button)
@@ -100,35 +112,37 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self._refresh_in_flight = False
-        self._refresh_thread = QThread(self)
-        self._refresh_worker = RefreshWorker(self.manager)
-        self._refresh_worker.moveToThread(self._refresh_thread)
-        self.refresh_requested.connect(self._refresh_worker.refresh)
-        self._refresh_worker.refreshed.connect(self._on_refresh_ready)
-        self._refresh_worker.failed.connect(self._on_refresh_failed)
-        self._refresh_thread.start()
+        self._add_in_flight = False
+        self._worker_thread = QThread(self)
+        self._worker = BackgroundWorker(self.manager)
+        self._worker.moveToThread(self._worker_thread)
+        self.refresh_requested.connect(self._worker.refresh)
+        self.add_requested.connect(self._worker.add_download)
+        self._worker.refreshed.connect(self._on_refresh_ready)
+        self._worker.refresh_failed.connect(self._on_refresh_failed)
+        self._worker.added.connect(self._on_add_ready)
+        self._worker.add_failed.connect(self._on_add_failed)
+        self._worker_thread.start()
 
-        # One status update per second is visually smooth enough and avoids
-        # hammering the local aria2 RPC endpoint while it reconnects segments.
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.request_refresh)
         self.timer.start(1000)
         QTimer.singleShot(0, self.request_refresh)
 
     def add_download(self) -> None:
+        if self._add_in_flight:
+            return
+
         url, accepted = QInputDialog.getText(self, "Add download", "Download URL:")
         if not accepted or not url.strip():
             return
 
         directory = QFileDialog.getExistingDirectory(self, "Choose download folder")
-        if not directory:
-            directory = None
-
-        try:
-            self.manager.add_download(url.strip(), directory)
-            self.request_refresh()
-        except Exception as exc:
-            QMessageBox.critical(self, "Could not add download", str(exc))
+        self._add_in_flight = True
+        self.add_button.setEnabled(False)
+        self.add_button.setText("Probing...")
+        self.statusBar().showMessage("Benchmarking the server before download...")
+        self.add_requested.emit(url.strip(), directory or "")
 
     def selected_gid(self) -> str | None:
         row = self.table.currentRow()
@@ -161,7 +175,13 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def request_refresh(self) -> None:
-        if self._refresh_in_flight or not self._refresh_thread.isRunning():
+        # The add operation and preflight probe run on the same worker. Do not
+        # queue refresh calls behind it every second.
+        if (
+            self._refresh_in_flight
+            or self._add_in_flight
+            or not self._worker_thread.isRunning()
+        ):
             return
         self._refresh_in_flight = True
         self.refresh_requested.emit()
@@ -179,6 +199,22 @@ class MainWindow(QMainWindow):
     def _on_refresh_failed(self, message: str) -> None:
         self._refresh_in_flight = False
         logger.warning("Refresh worker reported an error: %s", message)
+
+    @Slot(str)
+    def _on_add_ready(self, gid: str) -> None:
+        self._add_in_flight = False
+        self.add_button.setEnabled(True)
+        self.add_button.setText("Add URL")
+        self.statusBar().showMessage(f"Download started: {gid}", 5000)
+        self.request_refresh()
+
+    @Slot(str)
+    def _on_add_failed(self, message: str) -> None:
+        self._add_in_flight = False
+        self.add_button.setEnabled(True)
+        self.add_button.setText("Add URL")
+        self.statusBar().clearMessage()
+        QMessageBox.critical(self, "Could not add download", message)
 
     def _render_download(self, row: int, download: Download) -> None:
         progress = QProgressBar()
@@ -231,7 +267,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.timer.stop()
-        self._refresh_thread.quit()
-        if not self._refresh_thread.wait(8000):
-            logger.warning("Refresh worker did not stop before shutdown timeout")
+        self._worker_thread.quit()
+        if not self._worker_thread.wait(15000):
+            logger.warning("Background worker did not stop before shutdown timeout")
         super().closeEvent(event)
