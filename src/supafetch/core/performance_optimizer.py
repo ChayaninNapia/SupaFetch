@@ -94,6 +94,7 @@ class AdaptiveState:
     previous_connections: int = 2
     best_connections: int = 2
     best_speed_bps: int = 0
+    max_connections: int = 16
     last_decision_at: float = field(default_factory=time.monotonic)
     zero_samples: int = 0
 
@@ -109,7 +110,6 @@ class PerformanceOptimizer:
     WARMUP_SECONDS = 5.0
     EVALUATION_SECONDS = 6.0
     MIN_IMPROVEMENT = 0.10
-    DEGRADE_THRESHOLD = 0.92
 
     def __init__(self) -> None:
         self.profiles = HostProfileStore()
@@ -129,7 +129,12 @@ class PerformanceOptimizer:
             previous_connections=initial,
             best_connections=initial,
         )
-        logger.info("Adaptive optimizer registered gid=%s host=%s start_connections=%s", gid, host, initial)
+        logger.info(
+            "Adaptive optimizer registered gid=%s host=%s start_connections=%s",
+            gid,
+            host,
+            initial,
+        )
 
     def remove(self, gid: str) -> None:
         self.states.pop(gid, None)
@@ -165,7 +170,6 @@ class PerformanceOptimizer:
         if status != "active":
             return average, None, state.phase
 
-        # Tiny files finish too quickly to benefit from probing.
         remaining = max(0, total_bytes - completed_bytes)
         if total_bytes and total_bytes < 32 * 1024 * 1024:
             return average, None, "small-file"
@@ -175,11 +179,19 @@ class PerformanceOptimizer:
         now = time.monotonic()
         elapsed = now - state.last_decision_at
 
-        # If a previously healthy transfer stalls at higher concurrency, back off.
-        if state.zero_samples >= 4 and state.connections > 2:
-            target = self._previous_level(state.connections)
+        # If a transfer that already made progress stalls at higher concurrency,
+        # reduce pressure on the server and remember the lower ceiling.
+        if completed_bytes > 0 and state.zero_samples >= 4 and state.connections > 2:
+            old_connections = state.connections
+            target = self._previous_level(old_connections)
+            state.max_connections = min(state.max_connections, target)
             self._prepare_change(state, target, "fallback")
-            logger.warning("Adaptive stall fallback gid=%s %s -> %s", gid, state.connections, target)
+            logger.warning(
+                "Adaptive stall fallback gid=%s %s -> %s",
+                gid,
+                old_connections,
+                target,
+            )
             return average, target, "fallback"
 
         if len(state.samples) < 5 or elapsed < self.WARMUP_SECONDS:
@@ -191,7 +203,8 @@ class PerformanceOptimizer:
                 state.best_speed_bps = average
                 state.best_connections = state.connections
 
-            ceiling = self._connection_ceiling(total_bytes)
+            size_ceiling = self._connection_ceiling(total_bytes)
+            ceiling = min(size_ceiling, state.max_connections)
             target = self._next_level(state.connections, ceiling)
             if target == state.connections:
                 state.phase = "stable"
@@ -204,12 +217,13 @@ class PerformanceOptimizer:
             state.phase = "probing"
             state.last_decision_at = now
             logger.info(
-                "Adaptive probe gid=%s host=%s %s -> %s baseline=%sB/s",
+                "Adaptive probe gid=%s host=%s %s -> %s baseline=%sB/s ceiling=%s",
                 gid,
                 state.host,
                 state.previous_connections,
                 target,
                 state.baseline_speed_bps,
+                ceiling,
             )
             return average, target, "probing"
 
@@ -232,11 +246,13 @@ class PerformanceOptimizer:
                 self.profiles.update(state.host, state.best_connections, state.best_speed_bps)
                 return candidate_speed, None, "accepted"
 
+            failed_connections = state.connections
             rollback = state.previous_connections
+            state.max_connections = min(state.max_connections, rollback)
             logger.info(
                 "Adaptive rollback gid=%s %s -> %s candidate=%sB/s baseline=%sB/s improvement=%.1f%%",
                 gid,
-                state.connections,
+                failed_connections,
                 rollback,
                 candidate_speed,
                 state.baseline_speed_bps,
@@ -255,8 +271,13 @@ class PerformanceOptimizer:
         state = self.states.get(gid)
         if not state:
             return
-        logger.warning("Adaptive option change failed gid=%s; disabling further probing for this transfer", gid)
+        logger.warning(
+            "Adaptive option change failed gid=%s; limiting this transfer to %s connections",
+            gid,
+            state.previous_connections,
+        )
         state.connections = state.previous_connections
+        state.max_connections = min(state.max_connections, state.previous_connections)
         state.phase = "stable"
         state.last_decision_at = time.monotonic()
         state.samples.clear()
