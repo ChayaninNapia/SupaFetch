@@ -6,10 +6,10 @@ import sys
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from supafetch.core.adaptive_manager import DownloadManager
 from supafetch.core.aria2_client import Aria2Client
 from supafetch.core.aria2_service import Aria2Service
-from supafetch.core.download_manager import DownloadManager
-from supafetch.ui.main_window import MainWindow
+from supafetch.ui.adaptive_main_window import MainWindow
 
 
 def configure_logging() -> None:
@@ -38,10 +38,10 @@ def configure_logging() -> None:
 def main() -> int:
     configure_logging()
     logger = logging.getLogger("supafetch")
-    logger.info("Starting SupaFetch")
+    logger.info("Starting SupaFetch V5 Adaptive Intelligence")
 
     app = QApplication(sys.argv)
-    app.setApplicationName("SupaFetch")
+    app.setApplicationName("SupaFetch V5")
 
     service = Aria2Service()
     try:
@@ -52,7 +52,7 @@ def main() -> int:
         )
         QMessageBox.critical(
             None,
-            "SupaFetch",
+            "SupaFetch V5",
             str(exc),
         )
         return 1
@@ -66,7 +66,7 @@ def main() -> int:
     window.show()
 
     exit_code = app.exec()
-    logger.info("Stopping SupaFetch")
+    logger.info("Stopping SupaFetch V5")
     client.close()
     service.stop()
     return exit_code
