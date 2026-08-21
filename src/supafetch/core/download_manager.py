@@ -33,6 +33,7 @@ class DownloadManager:
         options = {
             "split": str(initial_connections),
             "max-connection-per-server": str(initial_connections),
+            "min-split-size": "1M",
         }
 
         logger.info(
@@ -83,17 +84,16 @@ class DownloadManager:
 
                 if target_connections is not None and download.status == "active":
                     try:
-                        self.client.change_option(
-                            gid,
-                            {
-                                "split": str(target_connections),
-                                "max-connection-per-server": str(target_connections),
-                            },
+                        options = self._adaptive_options(
+                            target_connections,
+                            download.total_bytes,
                         )
+                        self.client.change_option(gid, options)
                         logger.info(
-                            "Adaptive connection change applied gid=%s target=%s mode=%s",
+                            "Adaptive connection change applied gid=%s target=%s min_split=%s mode=%s",
                             gid,
                             target_connections,
+                            options["min-split-size"],
                             mode,
                         )
                     except Exception:
@@ -134,7 +134,21 @@ class DownloadManager:
                         payload.get("errorMessage", ""),
                     )
             except Exception:
-                # A temporary RPC/network problem should not make the row disappear.
                 logger.exception("Could not refresh gid=%s; keeping it tracked", gid)
 
         return downloads
+
+    @staticmethod
+    def _adaptive_options(connections: int, total_bytes: int) -> dict[str, str]:
+        if total_bytes >= 1024 * 1024 * 1024:
+            min_split_size = "8M"
+        elif total_bytes >= 256 * 1024 * 1024:
+            min_split_size = "4M"
+        else:
+            min_split_size = "1M"
+
+        return {
+            "split": str(connections),
+            "max-connection-per-server": str(connections),
+            "min-split-size": min_split_size,
+        }
