@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import statistics
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,8 +16,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class HostProfile:
+    # best_connections is the configured/requested aria2 ceiling that produced
+    # the best real-transfer result. It is intentionally separate from the
+    # number of connections aria2 actually kept active.
     best_connections: int = 2
     best_speed_bps: int = 0
+    best_observed_connections: int = 0
+    max_observed_connections: int = 0
+    safe_connection_ceiling: int = 16
+    rate_limit_risk: bool = False
     range_supported: bool = True
     last_probe_epoch: float = 0.0
     confidence: str = "low"
@@ -39,9 +47,27 @@ class HostProfileStore:
 
         for host, values in raw.items():
             try:
+                safe_ceiling = max(
+                    1,
+                    min(16, int(values.get("safe_connection_ceiling", 16))),
+                )
+                best_connections = max(
+                    1,
+                    min(safe_ceiling, int(values.get("best_connections", 2))),
+                )
                 self._profiles[host] = HostProfile(
-                    best_connections=max(1, min(16, int(values.get("best_connections", 2)))),
+                    best_connections=best_connections,
                     best_speed_bps=max(0, int(values.get("best_speed_bps", 0))),
+                    best_observed_connections=max(
+                        0,
+                        min(16, int(values.get("best_observed_connections", 0))),
+                    ),
+                    max_observed_connections=max(
+                        0,
+                        min(16, int(values.get("max_observed_connections", 0))),
+                    ),
+                    safe_connection_ceiling=safe_ceiling,
+                    rate_limit_risk=bool(values.get("rate_limit_risk", False)),
                     range_supported=bool(values.get("range_supported", True)),
                     last_probe_epoch=float(values.get("last_probe_epoch", 0.0)),
                     confidence=str(values.get("confidence", "low")),
@@ -55,38 +81,71 @@ class HostProfileStore:
     def record_preflight(self, result: PreflightResult) -> None:
         if not result.host:
             return
-        self._profiles[result.host] = HostProfile(
-            best_connections=result.best_connections,
-            best_speed_bps=result.peak_speed_bps,
-            range_supported=result.range_supported,
-            last_probe_epoch=time.time(),
-            confidence=result.confidence,
-        )
+
+        current = self._profiles.get(result.host, HostProfile())
+        safe_ceiling = max(1, min(16, result.safe_connection_ceiling))
+        selected = max(1, min(safe_ceiling, result.best_connections))
+
+        current.best_connections = selected
+        current.best_speed_bps = max(0, result.peak_speed_bps)
+        current.safe_connection_ceiling = safe_ceiling
+        current.rate_limit_risk = result.rate_limit_detected
+        current.range_supported = result.range_supported
+        current.last_probe_epoch = time.time()
+        current.confidence = result.confidence
+        self._profiles[result.host] = current
         self._save()
+
         logger.info(
-            "Saved preflight profile host=%s best_connections=%s peak=%sB/s range=%s confidence=%s",
+            "Saved preflight profile host=%s configured_best=%s peak=%sB/s safe_ceiling=%s rate_limit_risk=%s confidence=%s",
             result.host,
-            result.best_connections,
-            result.peak_speed_bps,
-            result.range_supported,
-            result.confidence,
+            current.best_connections,
+            current.best_speed_bps,
+            current.safe_connection_ceiling,
+            current.rate_limit_risk,
+            current.confidence,
         )
 
-    def record_runtime_result(self, host: str, connections: int, speed_bps: int) -> None:
+    def record_runtime_result(
+        self,
+        host: str,
+        configured_connections: int,
+        observed_typical: int,
+        observed_peak: int,
+        speed_bps: int,
+    ) -> None:
         if not host or speed_bps <= 0:
             return
+
         current = self._profiles.get(host, HostProfile())
-        current.best_connections = max(1, min(16, connections))
+        configured = max(
+            1,
+            min(current.safe_connection_ceiling, configured_connections),
+        )
+        observed_typical = max(0, min(16, observed_typical))
+        observed_peak = max(observed_typical, min(16, observed_peak))
+
+        current.best_connections = configured
         current.best_speed_bps = speed_bps
+        current.best_observed_connections = observed_typical
+        current.max_observed_connections = max(
+            current.max_observed_connections,
+            observed_peak,
+        )
         current.range_supported = True
         current.confidence = "real-transfer"
         self._profiles[host] = current
         self._save()
+
         logger.info(
-            "Learned runtime profile host=%s connections=%s stable_speed=%sB/s",
+            "Learned runtime profile host=%s configured=%s observed_typical=%s observed_peak=%s stable_speed=%sB/s safe_ceiling=%s rate_limit_risk=%s",
             host,
-            current.best_connections,
+            configured,
+            observed_typical,
+            observed_peak,
             speed_bps,
+            current.safe_connection_ceiling,
+            current.rate_limit_risk,
         )
 
     def lower_after_error(self, host: str, current_connections: int) -> None:
@@ -94,23 +153,36 @@ class HostProfileStore:
             return
         current = self._profiles.get(host, HostProfile())
         reduced = PerformanceOptimizer.previous_level(current_connections)
-        current.best_connections = reduced
+        current.best_connections = min(reduced, current.safe_connection_ceiling)
         current.confidence = "degraded"
         self._profiles[host] = current
         self._save()
-        logger.info("Reduced learned host connections after error host=%s -> %s", host, reduced)
+        logger.info(
+            "Reduced learned host configured connections after error host=%s -> %s",
+            host,
+            current.best_connections,
+        )
 
     def fallback_connections(self, host: str) -> int:
         profile = self.get(host)
         if not profile.range_supported:
             return 1
-        return max(1, min(16, profile.best_connections or 2))
+        return max(
+            1,
+            min(profile.safe_connection_ceiling, profile.best_connections or 2),
+        )
 
     def fallback_confidence(self, host: str) -> str:
         return self.get(host).confidence
 
     def expected_speed(self, host: str) -> int:
         return max(0, self.get(host).best_speed_bps)
+
+    def safe_connection_ceiling(self, host: str) -> int:
+        return max(1, min(16, self.get(host).safe_connection_ceiling))
+
+    def rate_limit_risk(self, host: str) -> bool:
+        return self.get(host).rate_limit_risk
 
     def _save(self) -> None:
         try:
@@ -119,6 +191,10 @@ class HostProfileStore:
                 host: {
                     "best_connections": profile.best_connections,
                     "best_speed_bps": profile.best_speed_bps,
+                    "best_observed_connections": profile.best_observed_connections,
+                    "max_observed_connections": profile.max_observed_connections,
+                    "safe_connection_ceiling": profile.safe_connection_ceiling,
+                    "rate_limit_risk": profile.rate_limit_risk,
                     "range_supported": profile.range_supported,
                     "last_probe_epoch": profile.last_probe_epoch,
                     "confidence": profile.confidence,
@@ -138,6 +214,10 @@ class PerformanceDecision:
     expected_speed_bps: int
     target_connections: int | None
     mode: str
+    configured_connections: int = 0
+    observed_connections: int = 0
+    safe_connection_ceiling: int = 16
+    rate_limit_risk: bool = False
 
 
 @dataclass(slots=True)
@@ -146,9 +226,13 @@ class TransferState:
     connections: int
     mode: str
     expected_speed_bps: int
+    safe_connection_ceiling: int = 16
+    rate_limit_risk: bool = False
     started_at: float = field(default_factory=time.monotonic)
     last_change_at: float = field(default_factory=time.monotonic)
-    history: deque[tuple[float, int]] = field(default_factory=lambda: deque(maxlen=180))
+    history: deque[tuple[float, int]] = field(
+        default_factory=lambda: deque(maxlen=180)
+    )
     peak_speed_bps: int = 0
     phase: str = "monitoring"
     previous_connections: int = 1
@@ -158,17 +242,22 @@ class TransferState:
     last_progress_at: float = field(default_factory=time.monotonic)
     last_completed_bytes: int = 0
     observed_connections: int = 0
+    observed_history: deque[int] = field(default_factory=lambda: deque(maxlen=60))
+    observed_peak_connections: int = 0
     last_telemetry_log_at: float = 0.0
+
+    @property
+    def observed_typical_connections(self) -> int:
+        values = [value for value in self.observed_history if value > 0]
+        if not values:
+            return self.observed_connections
+        # Median is deliberately conservative when aria2 oscillates between,
+        # for example, 3 and 4 active connections.
+        return int(round(statistics.median(values)))
 
 
 class PerformanceOptimizer:
-    """Phase 3 runtime validation and controlled connection boosting.
-
-    The optimizer measures sustained throughput from completed byte deltas rather
-    than trusting instantaneous aria2 speed. It may test a higher concurrency
-    only when a single transfer owns the host, and it rolls back when the test
-    does not improve sustained throughput enough.
-    """
+    """Phase 3 runtime validation with observed-connection awareness."""
 
     CONNECTION_LEVELS = (1, 2, 4, 8, 16)
     UNDERPERFORM_RATIO = 0.70
@@ -206,9 +295,14 @@ class PerformanceOptimizer:
         confidence: str = "",
         expected_speed_bps: int = 0,
     ) -> None:
-        normalized = self.normalize_level(connections)
+        safe_ceiling = self.profiles.safe_connection_ceiling(host)
+        normalized = min(self.normalize_level(connections), safe_ceiling)
+        rate_limit_risk = self.profiles.rate_limit_risk(host)
         suffix = f" ({confidence.title()})" if confidence else ""
         mode = f"{source}:{normalized}c{suffix}"
+        if rate_limit_risk:
+            mode += f" cap{safe_ceiling}"
+
         now = time.monotonic()
         self.states[gid] = TransferState(
             host=host,
@@ -216,15 +310,19 @@ class PerformanceOptimizer:
             previous_connections=normalized,
             mode=mode,
             expected_speed_bps=max(0, expected_speed_bps),
+            safe_connection_ceiling=safe_ceiling,
+            rate_limit_risk=rate_limit_risk,
             started_at=now,
             last_change_at=now,
             last_progress_at=now,
         )
         logger.info(
-            "Performance tracker registered gid=%s host=%s connections=%s source=%s confidence=%s expected=%.2fMB/s",
+            "Performance tracker registered gid=%s host=%s configured=%s safe_ceiling=%s rate_limit_risk=%s source=%s confidence=%s expected=%.2fMB/s",
             gid,
             host,
             normalized,
+            safe_ceiling,
+            rate_limit_risk,
             source,
             confidence or "n/a",
             expected_speed_bps / (1024 * 1024),
@@ -246,7 +344,16 @@ class PerformanceOptimizer:
         state = self.states.get(gid)
         if not state:
             speed = max(0, speed_bps)
-            return PerformanceDecision(speed, 0, speed, 0, None, "off")
+            return PerformanceDecision(
+                speed,
+                0,
+                speed,
+                0,
+                None,
+                "off",
+                observed_connections,
+                observed_connections,
+            )
 
         now = time.monotonic()
         completed = max(0, completed_bytes)
@@ -279,8 +386,8 @@ class PerformanceOptimizer:
 
         if status == "complete":
             learned = stable_reference or state.peak_speed_bps
-            if learned > 0:
-                self.profiles.record_runtime_result(state.host, state.connections, learned)
+            if learned > 0 and same_host_active <= 1:
+                self._record_runtime_state(state, learned)
             return self._decision(state, stable_10, stable_30, None, "complete")
 
         if status == "error":
@@ -292,13 +399,11 @@ class PerformanceOptimizer:
 
         remaining = max(0, total_bytes - completed) if total_bytes > 0 else 0
 
-        # Do not tune two transfers from the same CDN independently: one
-        # transfer's bandwidth changes would contaminate the other's benchmark.
         if same_host_active > 1:
             if state.phase == "testing" and state.connections != state.previous_connections:
                 target = state.previous_connections
                 logger.info(
-                    "Runtime boost aborted gid=%s because %s transfers share host=%s; rollback %s -> %s",
+                    "Runtime boost aborted gid=%s because %s transfers share host=%s; rollback configured %s -> %s",
                     gid,
                     same_host_active,
                     state.host,
@@ -309,14 +414,11 @@ class PerformanceOptimizer:
                 state.phase = "locked"
                 state.boost_locked = True
                 state.mode = f"shared-host:{target}c"
-                state.history.clear()
-                state.last_change_at = now
+                self._reset_measurement_windows(state, now)
                 return self._decision(state, 0, 0, target, state.mode)
             state.mode = f"shared-host:{state.connections}c"
             return self._decision(state, stable_10, stable_30, None, state.mode)
 
-        # A true no-progress stall is based on completed bytes, not the
-        # instantaneous speed field. Step down once and lock further tuning.
         if (
             completed > 0
             and now - state.last_progress_at >= self.STALL_SECONDS
@@ -325,7 +427,7 @@ class PerformanceOptimizer:
         ):
             target = self.previous_level(state.connections)
             logger.warning(
-                "Runtime stall fallback gid=%s host=%s %s -> %s connections no_progress=%.1fs",
+                "Runtime stall fallback gid=%s host=%s configured %s -> %s no_progress=%.1fs",
                 gid,
                 state.host,
                 state.connections,
@@ -337,14 +439,12 @@ class PerformanceOptimizer:
             state.phase = "locked"
             state.boost_locked = True
             state.mode = f"stall-fallback:{target}c"
-            state.history.clear()
-            state.last_change_at = now
+            self._reset_measurement_windows(state, now)
             return self._decision(state, 0, 0, target, state.mode)
 
         if state.boost_locked:
             return self._decision(state, stable_10, stable_30, None, state.mode)
 
-        # Evaluate a running boost after a clean settling window.
         if state.phase == "testing":
             if now - state.last_change_at < self.BOOST_TEST_SECONDS or stable_10 <= 0:
                 return self._decision(state, stable_10, stable_30, None, state.mode)
@@ -352,30 +452,37 @@ class PerformanceOptimizer:
             candidate = stable_10
             baseline = max(1, state.baseline_speed_bps)
             improvement = candidate / baseline - 1.0
+            observed_typical = state.observed_typical_connections
+            observed_peak = state.observed_peak_connections
+
             if improvement >= self.BOOST_MIN_IMPROVEMENT:
                 logger.info(
-                    "Runtime boost accepted gid=%s host=%s connections=%s baseline=%.2fMB/s candidate=%.2fMB/s improvement=%.1f%%",
+                    "Runtime boost accepted gid=%s host=%s configured=%s observed_typical=%s observed_peak=%s baseline=%.2fMB/s candidate=%.2fMB/s improvement=%.1f%%",
                     gid,
                     state.host,
                     state.connections,
+                    observed_typical,
+                    observed_peak,
                     baseline / (1024 * 1024),
                     candidate / (1024 * 1024),
                     improvement * 100,
                 )
-                self.profiles.record_runtime_result(state.host, state.connections, candidate)
+                self._record_runtime_state(state, candidate)
                 state.phase = "settling"
-                state.mode = f"boosted:{state.connections}c"
+                state.mode = f"boosted:cfg{state.connections}/obs{observed_typical}"
                 state.last_change_at = now
                 state.history.clear()
                 return self._decision(state, 0, 0, None, state.mode)
 
             target = state.previous_connections
             logger.info(
-                "Runtime boost rollback gid=%s host=%s %s -> %s baseline=%.2fMB/s candidate=%.2fMB/s improvement=%.1f%%",
+                "Runtime boost rollback gid=%s host=%s configured %s -> %s observed_typical=%s observed_peak=%s baseline=%.2fMB/s candidate=%.2fMB/s improvement=%.1f%%",
                 gid,
                 state.host,
                 state.connections,
                 target,
+                observed_typical,
+                observed_peak,
                 baseline / (1024 * 1024),
                 candidate / (1024 * 1024),
                 improvement * 100,
@@ -384,40 +491,55 @@ class PerformanceOptimizer:
             state.phase = "locked"
             state.boost_locked = True
             state.mode = f"rollback:{target}c"
-            state.history.clear()
-            state.last_change_at = now
+            self._reset_measurement_windows(state, now)
             return self._decision(state, 0, 0, target, state.mode)
 
-        # After an accepted 4->8 boost, one controlled 8->16 experiment is
-        # allowed for a large remaining file.
         if (
             state.phase == "settling"
             and now - state.last_change_at >= self.BOOST_SETTLE_SECONDS
-            and stable_10 > 0
-            and state.connections < 16
-            and (remaining == 0 or remaining >= self.MIN_REMAINING_FOR_SECOND_BOOST)
         ):
-            return self._start_boost(gid, state, stable_10, now)
+            if state.connections >= state.safe_connection_ceiling:
+                state.phase = "locked"
+                state.boost_locked = True
+                label = "rate-limit-cap" if state.rate_limit_risk else "maxed"
+                state.mode = f"{label}:cfg{state.connections}/obs{state.observed_typical_connections}"
+                logger.info(
+                    "Runtime boost ceiling reached gid=%s host=%s configured=%s observed_typical=%s safe_ceiling=%s rate_limit_risk=%s",
+                    gid,
+                    state.host,
+                    state.connections,
+                    state.observed_typical_connections,
+                    state.safe_connection_ceiling,
+                    state.rate_limit_risk,
+                )
+                return self._decision(state, stable_10, stable_30, None, state.mode)
 
-        # Initial runtime validation. Boost only when the real transfer remains
-        # materially below the preflight/profile expectation.
+            if (
+                stable_10 > 0
+                and (remaining == 0 or remaining >= self.MIN_REMAINING_FOR_SECOND_BOOST)
+            ):
+                return self._start_boost(gid, state, stable_10, now)
+
         elapsed = now - state.started_at
         if (
             state.phase == "monitoring"
             and elapsed >= self.INITIAL_MONITOR_SECONDS
             and stable_10 > 0
-            and state.connections < 16
+            and state.connections < state.safe_connection_ceiling
             and (remaining == 0 or remaining >= self.MIN_REMAINING_FOR_BOOST)
             and state.expected_speed_bps > 0
             and stable_10 < state.expected_speed_bps * self.UNDERPERFORM_RATIO
         ):
             logger.info(
-                "Runtime underperformance gid=%s host=%s stable10=%.2fMB/s expected=%.2fMB/s ratio=%.0f%%",
+                "Runtime underperformance gid=%s host=%s stable10=%.2fMB/s expected=%.2fMB/s ratio=%.0f%% configured=%s observed=%s safe_ceiling=%s",
                 gid,
                 state.host,
                 stable_10 / (1024 * 1024),
                 state.expected_speed_bps / (1024 * 1024),
                 stable_10 / max(1, state.expected_speed_bps) * 100,
+                state.connections,
+                state.observed_connections,
+                state.safe_connection_ceiling,
             )
             return self._start_boost(gid, state, stable_10, now)
 
@@ -432,8 +554,7 @@ class PerformanceOptimizer:
         state.phase = "locked"
         state.boost_locked = True
         state.mode = "change-failed"
-        state.history.clear()
-        state.last_change_at = time.monotonic()
+        self._reset_measurement_windows(state, time.monotonic())
         logger.warning("Runtime connection change failed gid=%s; locking optimizer", gid)
 
     def _start_boost(
@@ -443,11 +564,12 @@ class PerformanceOptimizer:
         baseline_speed_bps: int,
         now: float,
     ) -> PerformanceDecision:
-        target = self.next_level(state.connections)
+        target = self.next_level(state.connections, state.safe_connection_ceiling)
         if target == state.connections:
             state.phase = "locked"
             state.boost_locked = True
-            state.mode = f"maxed:{state.connections}c"
+            label = "rate-limit-cap" if state.rate_limit_risk else "maxed"
+            state.mode = f"{label}:{state.connections}c"
             return self._decision(state, 0, 0, None, state.mode)
 
         previous = state.connections
@@ -457,18 +579,28 @@ class PerformanceOptimizer:
         state.phase = "testing"
         state.boost_attempts += 1
         state.mode = f"boost-test:{previous}->{target}c"
-        state.last_change_at = now
-        state.history.clear()
+        self._reset_measurement_windows(state, now)
         logger.info(
-            "Runtime boost test gid=%s host=%s %s -> %s baseline=%.2fMB/s attempt=%s",
+            "Runtime boost test gid=%s host=%s configured %s -> %s baseline=%.2fMB/s attempt=%s safe_ceiling=%s rate_limit_risk=%s",
             gid,
             state.host,
             previous,
             target,
             baseline_speed_bps / (1024 * 1024),
             state.boost_attempts,
+            state.safe_connection_ceiling,
+            state.rate_limit_risk,
         )
         return self._decision(state, 0, 0, target, state.mode)
+
+    def _record_runtime_state(self, state: TransferState, speed_bps: int) -> None:
+        self.profiles.record_runtime_result(
+            host=state.host,
+            configured_connections=state.connections,
+            observed_typical=state.observed_typical_connections,
+            observed_peak=state.observed_peak_connections,
+            speed_bps=speed_bps,
+        )
 
     @staticmethod
     def _stable_speed(history: deque[tuple[float, int]], window: float) -> int:
@@ -506,7 +638,7 @@ class PerformanceOptimizer:
             return
         if state.observed_connections and observed_connections != state.observed_connections:
             logger.info(
-                "aria2 connection count changed gid=%s host=%s %s -> %s configured=%s",
+                "aria2 active connection count changed gid=%s host=%s %s -> %s configured=%s",
                 gid,
                 state.host,
                 state.observed_connections,
@@ -514,6 +646,11 @@ class PerformanceOptimizer:
                 state.connections,
             )
         state.observed_connections = observed_connections
+        state.observed_history.append(observed_connections)
+        state.observed_peak_connections = max(
+            state.observed_peak_connections,
+            observed_connections,
+        )
 
     def _log_telemetry(
         self,
@@ -529,7 +666,7 @@ class PerformanceOptimizer:
             return
         state.last_telemetry_log_at = now
         logger.info(
-            "Throughput gid=%s host=%s instant=%.2fMB/s stable10=%.2fMB/s stable30=%.2fMB/s peak=%.2fMB/s expected=%.2fMB/s observed_conn=%s configured_conn=%s same_host_active=%s mode=%s",
+            "Throughput gid=%s host=%s instant=%.2fMB/s stable10=%.2fMB/s stable30=%.2fMB/s peak=%.2fMB/s expected=%.2fMB/s active_conn=%s typical_conn=%s configured_conn=%s safe_ceiling=%s rate_limit_risk=%s same_host_active=%s mode=%s",
             gid,
             state.host,
             speed_bps / (1024 * 1024),
@@ -538,10 +675,20 @@ class PerformanceOptimizer:
             state.peak_speed_bps / (1024 * 1024),
             state.expected_speed_bps / (1024 * 1024),
             state.observed_connections or 0,
+            state.observed_typical_connections,
             state.connections,
+            state.safe_connection_ceiling,
+            state.rate_limit_risk,
             same_host_active,
             state.mode,
         )
+
+    @staticmethod
+    def _reset_measurement_windows(state: TransferState, now: float) -> None:
+        state.history.clear()
+        state.observed_history.clear()
+        state.observed_peak_connections = 0
+        state.last_change_at = now
 
     @staticmethod
     def _decision(
@@ -558,6 +705,10 @@ class PerformanceOptimizer:
             expected_speed_bps=state.expected_speed_bps,
             target_connections=target,
             mode=mode,
+            configured_connections=state.connections,
+            observed_connections=state.observed_connections,
+            safe_connection_ceiling=state.safe_connection_ceiling,
+            rate_limit_risk=state.rate_limit_risk,
         )
 
     @classmethod
@@ -565,9 +716,9 @@ class PerformanceOptimizer:
         return min(cls.CONNECTION_LEVELS, key=lambda item: abs(item - value))
 
     @classmethod
-    def next_level(cls, current: int) -> int:
+    def next_level(cls, current: int, ceiling: int = 16) -> int:
         for level in cls.CONNECTION_LEVELS:
-            if level > current:
+            if level > current and level <= ceiling:
                 return level
         return current
 
