@@ -7,6 +7,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from supafetch.core.preflight_probe import PreflightResult
+
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +17,8 @@ logger = logging.getLogger(__name__)
 class HostProfile:
     best_connections: int = 2
     best_speed_bps: int = 0
+    range_supported: bool = True
+    last_probe_epoch: float = 0.0
 
 
 class HostProfileStore:
@@ -35,8 +39,10 @@ class HostProfileStore:
         for host, values in raw.items():
             try:
                 self._profiles[host] = HostProfile(
-                    best_connections=max(2, min(16, int(values.get("best_connections", 2)))),
+                    best_connections=max(1, min(16, int(values.get("best_connections", 2)))),
                     best_speed_bps=max(0, int(values.get("best_speed_bps", 0))),
+                    range_supported=bool(values.get("range_supported", True)),
+                    last_probe_epoch=float(values.get("last_probe_epoch", 0.0)),
                 )
             except Exception:
                 logger.warning("Ignoring invalid host profile for %s", host)
@@ -44,30 +50,64 @@ class HostProfileStore:
     def get(self, host: str) -> HostProfile:
         return self._profiles.get(host, HostProfile())
 
-    def update(self, host: str, connections: int, speed_bps: int) -> None:
+    def record_preflight(self, result: PreflightResult) -> None:
+        if not result.host:
+            return
+        self._profiles[result.host] = HostProfile(
+            best_connections=result.best_connections,
+            best_speed_bps=result.peak_speed_bps,
+            range_supported=result.range_supported,
+            last_probe_epoch=time.time(),
+        )
+        self._save()
+        logger.info(
+            "Saved preflight profile host=%s best_connections=%s peak=%sB/s range=%s",
+            result.host,
+            result.best_connections,
+            result.peak_speed_bps,
+            result.range_supported,
+        )
+
+    def update_actual_speed(self, host: str, connections: int, speed_bps: int) -> None:
         if not host or speed_bps <= 0:
             return
         current = self._profiles.get(host)
-        if current and current.best_speed_bps >= speed_bps:
+        if current is None:
+            self._profiles[host] = HostProfile(
+                best_connections=connections,
+                best_speed_bps=speed_bps,
+                range_supported=True,
+                last_probe_epoch=0.0,
+            )
+            self._save()
             return
-        self._profiles[host] = HostProfile(connections, speed_bps)
-        self._save()
-        logger.info(
-            "Learned host profile host=%s best_connections=%s best_speed=%sB/s",
-            host,
-            connections,
-            speed_bps,
-        )
+
+        if speed_bps > current.best_speed_bps:
+            current.best_speed_bps = speed_bps
+            current.best_connections = connections
+            self._save()
+            logger.info(
+                "Updated host peak from real transfer host=%s connections=%s speed=%sB/s",
+                host,
+                connections,
+                speed_bps,
+            )
 
     def lower_after_error(self, host: str, current_connections: int) -> None:
-        if not host or current_connections <= 2:
+        if not host or current_connections <= 1:
             return
-        reduced = max(2, current_connections // 2)
-        current = self._profiles.get(host)
-        speed = current.best_speed_bps if current else 0
-        self._profiles[host] = HostProfile(reduced, speed)
+        current = self._profiles.get(host, HostProfile())
+        reduced = PerformanceOptimizer.previous_level(current_connections)
+        current.best_connections = reduced
+        self._profiles[host] = current
         self._save()
         logger.info("Reduced learned host connections after error host=%s -> %s", host, reduced)
+
+    def fallback_connections(self, host: str) -> int:
+        profile = self.get(host)
+        if not profile.range_supported:
+            return 1
+        return max(1, min(16, profile.best_connections or 2))
 
     def _save(self) -> None:
         try:
@@ -76,6 +116,8 @@ class HostProfileStore:
                 host: {
                     "best_connections": profile.best_connections,
                     "best_speed_bps": profile.best_speed_bps,
+                    "range_supported": profile.range_supported,
+                    "last_probe_epoch": profile.last_probe_epoch,
                 }
                 for host, profile in self._profiles.items()
             }
@@ -85,57 +127,58 @@ class HostProfileStore:
 
 
 @dataclass(slots=True)
-class AdaptiveState:
+class TransferState:
     host: str
     connections: int
+    mode: str
     samples: deque[int] = field(default_factory=lambda: deque(maxlen=12))
-    phase: str = "warming"
-    baseline_speed_bps: int = 0
-    previous_connections: int = 2
-    best_connections: int = 2
-    best_speed_bps: int = 0
-    max_connections: int = 16
-    last_decision_at: float = field(default_factory=time.monotonic)
     zero_samples: int = 0
+    fallback_applied: bool = False
+    best_observed_speed_bps: int = 0
 
     @property
     def rolling_average_bps(self) -> int:
-        if not self.samples:
+        nonzero = [sample for sample in self.samples if sample > 0]
+        if not nonzero:
             return 0
-        return int(sum(self.samples) / len(self.samples))
+        return int(sum(nonzero) / len(nonzero))
 
 
 class PerformanceOptimizer:
-    CONNECTION_LEVELS = (2, 4, 8, 16)
-    # aria2 restarts an active transfer internally when split/connection options
-    # change, so probes must be long enough to amortize reconnection overhead.
-    WARMUP_SECONDS = 8.0
-    EVALUATION_SECONDS = 10.0
-    MIN_IMPROVEMENT = 0.10
+    """Track transfers after the preflight benchmark.
+
+    Phase 2 deliberately avoids increasing concurrency during an active transfer.
+    The only mid-download connection change is a conservative fallback when a
+    previously active transfer stalls repeatedly.
+    """
+
+    CONNECTION_LEVELS = (1, 2, 4, 8, 16)
+    STALL_SAMPLES_BEFORE_FALLBACK = 6
 
     def __init__(self) -> None:
         self.profiles = HostProfileStore()
-        self.states: dict[str, AdaptiveState] = {}
+        self.states: dict[str, TransferState] = {}
 
-    def initial_connections(self, host: str) -> int:
-        profile = self.profiles.get(host)
-        if profile.best_speed_bps > 0:
-            return profile.best_connections
-        return 2
+    def record_preflight(self, result: PreflightResult) -> None:
+        self.profiles.record_preflight(result)
 
-    def register(self, gid: str, host: str, initial_connections: int) -> None:
-        initial = self._normalize_level(initial_connections)
-        self.states[gid] = AdaptiveState(
+    def fallback_connections(self, host: str) -> int:
+        return self.profiles.fallback_connections(host)
+
+    def register(self, gid: str, host: str, connections: int, source: str) -> None:
+        normalized = self.normalize_level(connections)
+        mode = f"{source}:{normalized}c"
+        self.states[gid] = TransferState(
             host=host,
-            connections=initial,
-            previous_connections=initial,
-            best_connections=initial,
+            connections=normalized,
+            mode=mode,
         )
         logger.info(
-            "Adaptive optimizer registered gid=%s host=%s start_connections=%s",
+            "Performance tracker registered gid=%s host=%s connections=%s source=%s",
             gid,
             host,
-            initial,
+            normalized,
+            source,
         )
 
     def remove(self, gid: str) -> None:
@@ -146,173 +189,73 @@ class PerformanceOptimizer:
         gid: str,
         status: str,
         speed_bps: int,
-        total_bytes: int,
         completed_bytes: int,
     ) -> tuple[int, int | None, str]:
         state = self.states.get(gid)
         if not state:
-            return speed_bps, None, "off"
+            return max(0, speed_bps), None, "off"
 
         speed = max(0, speed_bps)
         state.samples.append(speed)
-        state.zero_samples = state.zero_samples + 1 if speed == 0 else 0
+        if speed > 0:
+            state.zero_samples = 0
+            state.best_observed_speed_bps = max(state.best_observed_speed_bps, speed)
+        elif status == "active" and completed_bytes > 0:
+            state.zero_samples += 1
+
         average = state.rolling_average_bps
 
         if status == "complete":
-            if average > state.best_speed_bps:
-                state.best_speed_bps = average
-                state.best_connections = state.connections
-            self.profiles.update(state.host, state.best_connections, state.best_speed_bps)
-            return average, None, "learned"
+            actual_peak = max(state.best_observed_speed_bps, average)
+            self.profiles.update_actual_speed(
+                state.host,
+                state.connections,
+                actual_peak,
+            )
+            return average, None, "complete"
 
         if status == "error":
             self.profiles.lower_after_error(state.host, state.connections)
             return average, None, "error"
 
         if status != "active":
-            return average, None, state.phase
+            return average, None, state.mode
 
-        remaining = max(0, total_bytes - completed_bytes)
-        if total_bytes and total_bytes < 32 * 1024 * 1024:
-            return average, None, "small-file"
-        if remaining and remaining < 16 * 1024 * 1024:
-            return average, None, "finishing"
-
-        now = time.monotonic()
-        elapsed = now - state.last_decision_at
-
-        if completed_bytes > 0 and state.zero_samples >= 6 and state.connections > 2:
-            old_connections = state.connections
-            target = self._previous_level(old_connections)
-            state.max_connections = min(state.max_connections, target)
-            self._prepare_change(state, target, "fallback")
+        if (
+            not state.fallback_applied
+            and state.zero_samples >= self.STALL_SAMPLES_BEFORE_FALLBACK
+            and state.connections > 1
+        ):
+            target = self.previous_level(state.connections)
             logger.warning(
-                "Adaptive stall fallback gid=%s %s -> %s",
-                gid,
-                old_connections,
-                target,
-            )
-            return average, target, "fallback"
-
-        if len(state.samples) < 8 or elapsed < self.WARMUP_SECONDS:
-            return average, None, state.phase
-
-        if state.phase in {"warming", "stable", "settling"}:
-            state.baseline_speed_bps = max(1, average)
-            if average > state.best_speed_bps:
-                state.best_speed_bps = average
-                state.best_connections = state.connections
-
-            size_ceiling = self._connection_ceiling(total_bytes)
-            ceiling = min(size_ceiling, state.max_connections)
-            target = self._next_level(state.connections, ceiling)
-            if target == state.connections:
-                state.phase = "stable"
-                self.profiles.update(state.host, state.best_connections, state.best_speed_bps)
-                return average, None, "stable"
-
-            state.previous_connections = state.connections
-            state.connections = target
-            state.samples.clear()
-            state.phase = "probing"
-            state.last_decision_at = now
-            logger.info(
-                "Adaptive probe gid=%s host=%s %s -> %s baseline=%sB/s ceiling=%s",
+                "Transfer stall fallback gid=%s host=%s %s -> %s connections",
                 gid,
                 state.host,
-                state.previous_connections,
+                state.connections,
                 target,
-                state.baseline_speed_bps,
-                ceiling,
             )
-            return average, target, "probing"
-
-        if state.phase == "probing" and elapsed >= self.EVALUATION_SECONDS and len(state.samples) >= 8:
-            candidate_speed = max(1, average)
-            ratio = candidate_speed / max(1, state.baseline_speed_bps)
-            if ratio >= 1.0 + self.MIN_IMPROVEMENT:
-                state.best_speed_bps = max(state.best_speed_bps, candidate_speed)
-                state.best_connections = state.connections
-                state.phase = "stable"
-                state.last_decision_at = now
-                state.samples.clear()
-                logger.info(
-                    "Adaptive accepted gid=%s connections=%s speed=%sB/s improvement=%.1f%%",
-                    gid,
-                    state.connections,
-                    candidate_speed,
-                    (ratio - 1.0) * 100,
-                )
-                self.profiles.update(state.host, state.best_connections, state.best_speed_bps)
-                return candidate_speed, None, "accepted"
-
-            failed_connections = state.connections
-            rollback = state.previous_connections
-            state.max_connections = min(state.max_connections, rollback)
-            logger.info(
-                "Adaptive rollback gid=%s %s -> %s candidate=%sB/s baseline=%sB/s improvement=%.1f%%",
-                gid,
-                failed_connections,
-                rollback,
-                candidate_speed,
-                state.baseline_speed_bps,
-                (ratio - 1.0) * 100,
-            )
-            state.connections = rollback
-            state.phase = "settling"
-            state.last_decision_at = now
+            state.connections = target
+            state.mode = f"fallback:{target}c"
+            state.fallback_applied = True
             state.samples.clear()
-            self.profiles.update(state.host, state.best_connections, state.best_speed_bps)
-            return candidate_speed, rollback, "rollback"
+            state.zero_samples = 0
+            return average, target, state.mode
 
-        return average, None, state.phase
+        return average, None, state.mode
 
     def change_failed(self, gid: str) -> None:
         state = self.states.get(gid)
         if not state:
             return
-        logger.warning(
-            "Adaptive option change failed gid=%s; limiting this transfer to %s connections",
-            gid,
-            state.previous_connections,
-        )
-        state.connections = state.previous_connections
-        state.max_connections = min(state.max_connections, state.previous_connections)
-        state.phase = "stable"
-        state.last_decision_at = time.monotonic()
-        state.samples.clear()
+        state.mode = "fallback-failed"
+        state.fallback_applied = True
+        logger.warning("Fallback option change failed gid=%s", gid)
 
     @classmethod
-    def _connection_ceiling(cls, total_bytes: int) -> int:
-        if total_bytes <= 0:
-            return 8
-        if total_bytes < 100 * 1024 * 1024:
-            return 2
-        if total_bytes < 1024 * 1024 * 1024:
-            return 8
-        return 16
-
-    @classmethod
-    def _normalize_level(cls, value: int) -> int:
+    def normalize_level(cls, value: int) -> int:
         return min(cls.CONNECTION_LEVELS, key=lambda item: abs(item - value))
 
     @classmethod
-    def _next_level(cls, current: int, ceiling: int) -> int:
-        allowed = [level for level in cls.CONNECTION_LEVELS if level <= ceiling]
-        for level in allowed:
-            if level > current:
-                return level
-        return current
-
-    @classmethod
-    def _previous_level(cls, current: int) -> int:
+    def previous_level(cls, current: int) -> int:
         lower = [level for level in cls.CONNECTION_LEVELS if level < current]
-        return lower[-1] if lower else 2
-
-    @staticmethod
-    def _prepare_change(state: AdaptiveState, target: int, phase: str) -> None:
-        state.previous_connections = state.connections
-        state.connections = target
-        state.phase = phase
-        state.samples.clear()
-        state.last_decision_at = time.monotonic()
+        return lower[-1] if lower else 1
