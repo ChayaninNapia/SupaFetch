@@ -63,16 +63,19 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.manager = manager
         self.setWindowTitle("SupaFetch")
-        self.resize(1180, 540)
+        self.resize(1480, 560)
 
-        self.table = QTableWidget(0, 10)
+        self.table = QTableWidget(0, 13)
         self.table.setHorizontalHeaderLabels(
             [
                 "File",
                 "Progress",
                 "Downloaded",
                 "Speed",
-                "Avg Speed",
+                "Stable 10s",
+                "Stable 30s",
+                "Peak",
+                "Expected",
                 "Conn",
                 "ETA",
                 "Optimizer",
@@ -82,7 +85,7 @@ class MainWindow(QMainWindow):
         )
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(12, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
 
@@ -140,15 +143,15 @@ class MainWindow(QMainWindow):
         directory = QFileDialog.getExistingDirectory(self, "Choose download folder")
         self._add_in_flight = True
         self.add_button.setEnabled(False)
-        self.add_button.setText("Probing...")
-        self.statusBar().showMessage("Benchmarking the server before download...")
+        self.add_button.setText("Preparing...")
+        self.statusBar().showMessage("Selecting the best download strategy...")
         self.add_requested.emit(url.strip(), directory or "")
 
     def selected_gid(self) -> str | None:
         row = self.table.currentRow()
         if row < 0:
             return None
-        item = self.table.item(row, 9)
+        item = self.table.item(row, 12)
         return item.text() if item else None
 
     def pause_selected(self) -> None:
@@ -175,8 +178,6 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def request_refresh(self) -> None:
-        # The add operation and preflight probe run on the same worker. Do not
-        # queue refresh calls behind it every second.
         if (
             self._refresh_in_flight
             or self._add_in_flight
@@ -241,12 +242,15 @@ class MainWindow(QMainWindow):
             0: download.name,
             2: f"{format_bytes(download.completed_bytes)} / {format_bytes(download.total_bytes)}",
             3: format_speed(download.speed_bps),
-            4: format_speed(download.average_speed_bps),
-            5: str(download.connections),
-            6: eta,
-            7: download.adaptive_mode,
-            8: download.status,
-            9: download.gid,
+            4: format_speed(download.stable_10_bps),
+            5: format_speed(download.stable_30_bps),
+            6: format_speed(download.peak_speed_bps),
+            7: format_speed(download.expected_speed_bps),
+            8: str(download.connections),
+            9: eta,
+            10: download.adaptive_mode,
+            11: download.status,
+            12: download.gid,
         }
         for column, value in values.items():
             self.table.setItem(row, column, QTableWidgetItem(value))
@@ -258,7 +262,11 @@ class MainWindow(QMainWindow):
         if download.status == "paused":
             return "Paused"
 
-        eta_speed = download.average_speed_bps or download.speed_bps
+        eta_speed = (
+            download.stable_30_bps
+            or download.stable_10_bps
+            or download.speed_bps
+        )
         if eta_speed <= 0 or download.total_bytes <= 0:
             return "--"
 
