@@ -239,4 +239,5 @@ class DownloadManager:
             "split": str(connections),
             "max-connection-per-server": str(connections),
             "min-split-size": min_split_size,
+            "user-agent": RangePreflightProbe.USER_AGENT,
         }
