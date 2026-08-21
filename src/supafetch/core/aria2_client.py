@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import requests
+
+
+logger = logging.getLogger(__name__)
 
 
 class Aria2Client:
@@ -13,32 +17,51 @@ class Aria2Client:
 
     def _call(self, method: str, *params: Any) -> Any:
         self._request_id += 1
+        request_id = str(self._request_id)
         payload = {
             "jsonrpc": "2.0",
-            "id": str(self._request_id),
+            "id": request_id,
             "method": method,
             "params": [f"token:{self.secret}", *params],
         }
-        response = requests.post(self.rpc_url, json=payload, timeout=5)
-        response.raise_for_status()
-        data = response.json()
+        logger.debug("RPC -> %s id=%s", method, request_id)
+        try:
+            response = requests.post(self.rpc_url, json=payload, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException:
+            logger.exception("RPC transport failure: %s id=%s", method, request_id)
+            raise
+        except ValueError:
+            logger.exception("RPC returned invalid JSON: %s id=%s", method, request_id)
+            raise
+
         if "error" in data:
-            raise RuntimeError(data["error"].get("message", "aria2 RPC error"))
+            error = data["error"]
+            logger.error("RPC error: %s id=%s error=%r", method, request_id, error)
+            raise RuntimeError(error.get("message", "aria2 RPC error"))
+
+        logger.debug("RPC <- %s id=%s ok", method, request_id)
         return data.get("result")
 
     def add_uri(self, url: str, directory: str | None = None) -> str:
         options: dict[str, str] = {}
         if directory:
             options["dir"] = directory
-        return self._call("aria2.addUri", [url], options)
+        gid = self._call("aria2.addUri", [url], options)
+        logger.info("Download added gid=%s host=%s", gid, requests.utils.urlparse(url).hostname)
+        return gid
 
     def pause(self, gid: str) -> str:
+        logger.info("Pause requested gid=%s", gid)
         return self._call("aria2.pause", gid)
 
     def resume(self, gid: str) -> str:
+        logger.info("Resume requested gid=%s", gid)
         return self._call("aria2.unpause", gid)
 
     def remove(self, gid: str) -> str:
+        logger.info("Remove requested gid=%s", gid)
         try:
             return self._call("aria2.remove", gid)
         except RuntimeError:
@@ -51,7 +74,9 @@ class Aria2Client:
             "totalLength",
             "completedLength",
             "downloadSpeed",
+            "connections",
             "files",
+            "errorCode",
             "errorMessage",
         ]
         return self._call("aria2.tellStatus", gid, keys)
