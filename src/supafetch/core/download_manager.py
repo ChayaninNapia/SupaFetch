@@ -40,21 +40,21 @@ class DownloadManager:
 
         host = (parsed.hostname or "unknown").lower()
 
-        # Phase 1 + 2: benchmark small byte ranges before starting aria2 so the
-        # real transfer begins with the best measured concurrency and does not
-        # need repeated reconnects while downloading.
         preflight = self.preflight.run(url)
         if preflight.source == "probe-failed":
             selected_connections = self.optimizer.fallback_connections(host)
             strategy = "profile-fallback"
+            confidence = self.optimizer.fallback_confidence(host)
             logger.warning(
-                "Preflight unavailable host=%s; falling back to %s connection(s)",
+                "Preflight unavailable host=%s; falling back to %s connection(s) confidence=%s",
                 host,
                 selected_connections,
+                confidence,
             )
         else:
             selected_connections = preflight.best_connections
             strategy = preflight.source
+            confidence = preflight.confidence
             self.optimizer.record_preflight(preflight)
 
         options = self._download_options(
@@ -62,10 +62,11 @@ class DownloadManager:
             preflight.total_bytes,
         )
         logger.info(
-            "Starting download host=%s strategy=%s connections=%s total=%s benchmark=%s",
+            "Starting download host=%s strategy=%s connections=%s confidence=%s total=%s benchmark=%s",
             host,
             strategy,
             selected_connections,
+            confidence,
             preflight.total_bytes,
             preflight.summary,
         )
@@ -76,7 +77,13 @@ class DownloadManager:
                 self._gids.append(gid)
             self._last_status[gid] = "added"
             self._hosts[gid] = host
-            self.optimizer.register(gid, host, selected_connections, strategy)
+            self.optimizer.register(
+                gid,
+                host,
+                selected_connections,
+                strategy,
+                confidence,
+            )
         logger.info("Tracking gid=%s", gid)
         return gid
 
@@ -130,9 +137,8 @@ class DownloadManager:
                     download.average_speed_bps = average_speed
                     download.adaptive_mode = mode
 
-                    # No upward probing happens here anymore. The only
-                    # mid-download change is a conservative fallback after a
-                    # sustained stall.
+                    # Preflight V2 never increases concurrency mid-download.
+                    # Only a sustained stall can trigger a conservative step-down.
                     if target_connections is not None and download.status == "active":
                         options = self._download_options(
                             target_connections,
