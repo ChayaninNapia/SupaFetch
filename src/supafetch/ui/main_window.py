@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (
 
 from supafetch.core.download_manager import DownloadManager
 from supafetch.models.download import Download
-from supafetch.utils.formatters import format_bytes, format_speed
+from supafetch.utils.formatters import format_bytes, format_duration, format_speed
 
 
 class MainWindow(QMainWindow):
@@ -25,14 +26,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.manager = manager
         self.setWindowTitle("SupaFetch")
-        self.resize(900, 520)
+        self.resize(980, 520)
 
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["File", "Progress", "Downloaded", "Speed", "Status", "GID"]
+            ["File", "Progress", "Downloaded", "Speed", "ETA", "Status", "GID"]
         )
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
 
@@ -84,7 +86,7 @@ class MainWindow(QMainWindow):
         row = self.table.currentRow()
         if row < 0:
             return None
-        item = self.table.item(row, 5)
+        item = self.table.item(row, 6)
         return item.text() if item else None
 
     def pause_selected(self) -> None:
@@ -116,13 +118,45 @@ class MainWindow(QMainWindow):
             self._render_download(row, download)
 
     def _render_download(self, row: int, download: Download) -> None:
-        values = [
-            download.name,
-            f"{download.progress:.1f}%",
-            f"{format_bytes(download.completed_bytes)} / {format_bytes(download.total_bytes)}",
-            format_speed(download.speed_bps),
-            download.status,
-            download.gid,
-        ]
-        for column, value in enumerate(values):
+        progress = QProgressBar()
+        progress.setRange(0, 1000)
+        progress.setValue(round(download.progress * 10))
+        progress.setFormat(f"{download.progress:.1f}%")
+        progress.setTextVisible(True)
+        progress.setStyleSheet(
+            "QProgressBar {"
+            "  border: 1px solid #b8b8b8;"
+            "  border-radius: 4px;"
+            "  text-align: center;"
+            "  background: #f2f2f2;"
+            "}"
+            "QProgressBar::chunk {"
+            "  background-color: #2eaf55;"
+            "  border-radius: 3px;"
+            "}"
+        )
+        self.table.setCellWidget(row, 1, progress)
+
+        eta = self._format_eta(download)
+        values = {
+            0: download.name,
+            2: f"{format_bytes(download.completed_bytes)} / {format_bytes(download.total_bytes)}",
+            3: format_speed(download.speed_bps),
+            4: eta,
+            5: download.status,
+            6: download.gid,
+        }
+        for column, value in values.items():
             self.table.setItem(row, column, QTableWidgetItem(value))
+
+    @staticmethod
+    def _format_eta(download: Download) -> str:
+        if download.status == "complete":
+            return "Done"
+        if download.status == "paused":
+            return "Paused"
+        if download.speed_bps <= 0 or download.total_bytes <= 0:
+            return "--"
+
+        remaining_bytes = max(0, download.total_bytes - download.completed_bytes)
+        return format_duration(remaining_bytes / download.speed_bps)
