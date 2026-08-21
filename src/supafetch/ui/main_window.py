@@ -105,7 +105,7 @@ class MainWindow(QMainWindow):
     def __init__(self, manager: DownloadManager) -> None:
         super().__init__()
         self.manager = manager
-        self.setWindowTitle("SupaFetch")
+        self.setWindowTitle("SupaFetch V4")
         self.resize(1500, 560)
 
         self.table = QTableWidget(0, 13)
