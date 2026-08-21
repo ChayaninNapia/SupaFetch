@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -49,7 +50,7 @@ class Aria2Client:
         if directory:
             options["dir"] = directory
         gid = self._call("aria2.addUri", [url], options)
-        logger.info("Download added gid=%s host=%s", gid, requests.utils.urlparse(url).hostname)
+        logger.info("Download added gid=%s host=%s", gid, urlparse(url).hostname)
         return gid
 
     def pause(self, gid: str) -> str:
