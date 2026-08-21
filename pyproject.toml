@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supafetch"
+version = "0.1.0"
+description = "Desktop download manager powered by aria2"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.7,<7",
+    "requests>=2.32,<3",
+]
+
+[project.scripts]
+supafetch = "supafetch.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
