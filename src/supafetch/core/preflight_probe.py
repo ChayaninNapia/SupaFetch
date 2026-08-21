@@ -62,10 +62,12 @@ class RangePreflightProbe:
     CONNECTION_LEVELS = (1, 2, 4, 8, 16)
     MIN_IMPROVEMENT = 0.08
     NEAR_PEAK_RATIO = 0.95
-    USER_AGENT = "SupaFetch/0.1 preflight"
+    USER_AGENT = "SupaFetch/0.1"
+    MAX_PROBE_SECONDS = 15.0
 
     def run(self, url: str) -> PreflightResult:
         host = (urlparse(url).hostname or "unknown").lower()
+        probe_started = time.monotonic()
         try:
             range_supported, total_bytes = self._inspect(url)
         except Exception as exc:
@@ -108,6 +110,10 @@ class RangePreflightProbe:
         )
 
         for connections in levels:
+            if time.monotonic() - probe_started >= self.MAX_PROBE_SECONDS:
+                logger.info("Preflight time budget reached host=%s", host)
+                break
+
             measurement = self._measure_level(
                 url=url,
                 total_bytes=total_bytes,
