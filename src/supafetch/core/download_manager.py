@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from supafetch.core.aria2_client import Aria2Client, Aria2RpcTimeout
 from supafetch.core.performance_optimizer import PerformanceOptimizer
+from supafetch.core.preflight_probe import RangePreflightProbe
 from supafetch.models.download import Download
 
 
@@ -16,13 +17,12 @@ logger = logging.getLogger(__name__)
 
 
 class DownloadManager:
-    # aria2 may briefly stop answering status RPC calls after split/connection
-    # options are changed because the transfer is internally reconnected.
-    ADAPTIVE_RECONNECT_GRACE_SECONDS = 3.0
+    FALLBACK_RECONNECT_GRACE_SECONDS = 3.0
 
     def __init__(self, client: Aria2Client) -> None:
         self.client = client
         self.optimizer = PerformanceOptimizer()
+        self.preflight = RangePreflightProbe()
         self._gids: list[str] = []
         self._last_status: dict[str, str] = {}
         self._hosts: dict[str, str] = {}
@@ -31,36 +31,54 @@ class DownloadManager:
         self._lock = threading.RLock()
 
     def add_download(self, url: str, directory: str | None = None) -> str:
-        with self._lock:
-            parsed = urlparse(url)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise ValueError("Please enter a valid HTTP or HTTPS URL.")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Please enter a valid HTTP or HTTPS URL.")
 
-            if directory:
-                directory = str(Path(directory).expanduser().resolve())
+        if directory:
+            directory = str(Path(directory).expanduser().resolve())
 
-            host = (parsed.hostname or "unknown").lower()
-            initial_connections = self.optimizer.initial_connections(host)
-            options = {
-                "split": str(initial_connections),
-                "max-connection-per-server": str(initial_connections),
-                "min-split-size": "1M",
-            }
+        host = (parsed.hostname or "unknown").lower()
 
-            logger.info(
-                "Adding download host=%s directory=%s adaptive_start_connections=%s",
+        # Phase 1 + 2: benchmark small byte ranges before starting aria2 so the
+        # real transfer begins with the best measured concurrency and does not
+        # need repeated reconnects while downloading.
+        preflight = self.preflight.run(url)
+        if preflight.source == "probe-failed":
+            selected_connections = self.optimizer.fallback_connections(host)
+            strategy = "profile-fallback"
+            logger.warning(
+                "Preflight unavailable host=%s; falling back to %s connection(s)",
                 host,
-                directory or "default",
-                initial_connections,
+                selected_connections,
             )
-            gid = self.client.add_uri(url, directory, options)
+        else:
+            selected_connections = preflight.best_connections
+            strategy = preflight.source
+            self.optimizer.record_preflight(preflight)
+
+        options = self._download_options(
+            selected_connections,
+            preflight.total_bytes,
+        )
+        logger.info(
+            "Starting download host=%s strategy=%s connections=%s total=%s benchmark=%s",
+            host,
+            strategy,
+            selected_connections,
+            preflight.total_bytes,
+            preflight.summary,
+        )
+
+        gid = self.client.add_uri(url, directory, options)
+        with self._lock:
             if gid not in self._gids:
                 self._gids.append(gid)
             self._last_status[gid] = "added"
             self._hosts[gid] = host
-            self.optimizer.register(gid, host, initial_connections)
-            logger.info("Tracking gid=%s", gid)
-            return gid
+            self.optimizer.register(gid, host, selected_connections, strategy)
+        logger.info("Tracking gid=%s", gid)
+        return gid
 
     def pause(self, gid: str) -> None:
         with self._lock:
@@ -107,53 +125,51 @@ class DownloadManager:
                         gid=gid,
                         status=download.status,
                         speed_bps=download.speed_bps,
-                        total_bytes=download.total_bytes,
                         completed_bytes=download.completed_bytes,
                     )
                     download.average_speed_bps = average_speed
                     download.adaptive_mode = mode
 
+                    # No upward probing happens here anymore. The only
+                    # mid-download change is a conservative fallback after a
+                    # sustained stall.
                     if target_connections is not None and download.status == "active":
-                        options = self._adaptive_options(
+                        options = self._download_options(
                             target_connections,
                             download.total_bytes,
                         )
                         try:
                             self.client.change_option(gid, options)
                             self._poll_suppressed_until[gid] = (
-                                time.monotonic() + self.ADAPTIVE_RECONNECT_GRACE_SECONDS
+                                time.monotonic() + self.FALLBACK_RECONNECT_GRACE_SECONDS
                             )
                             download.connections = target_connections
                             download.adaptive_mode = "reconnecting"
                             logger.info(
-                                "Adaptive connection change applied gid=%s target=%s min_split=%s grace=%.1fs",
+                                "Fallback connection change applied gid=%s target=%s grace=%.1fs",
                                 gid,
                                 target_connections,
-                                options["min-split-size"],
-                                self.ADAPTIVE_RECONNECT_GRACE_SECONDS,
+                                self.FALLBACK_RECONNECT_GRACE_SECONDS,
                             )
                         except Aria2RpcTimeout:
-                            # A timeout here is ambiguous: aria2 may have accepted the
-                            # change and then become busy reconnecting. Keep the new
-                            # optimizer state and wait before polling again.
                             self._poll_suppressed_until[gid] = (
-                                time.monotonic() + self.ADAPTIVE_RECONNECT_GRACE_SECONDS
+                                time.monotonic() + self.FALLBACK_RECONNECT_GRACE_SECONDS
                             )
                             download.connections = target_connections
                             download.adaptive_mode = "reconnecting"
                             logger.warning(
-                                "Adaptive change response timed out gid=%s target=%s; treating as pending",
+                                "Fallback change response timed out gid=%s target=%s; treating as pending",
                                 gid,
                                 target_connections,
                             )
                         except Exception:
                             logger.exception(
-                                "Adaptive connection change failed gid=%s target=%s",
+                                "Fallback connection change failed gid=%s target=%s",
                                 gid,
                                 target_connections,
                             )
                             self.optimizer.change_failed(gid)
-                            download.adaptive_mode = "change-failed"
+                            download.adaptive_mode = "fallback-failed"
 
                     self._last_downloads[gid] = download
                     downloads.append(download)
@@ -161,7 +177,7 @@ class DownloadManager:
                     previous = self._last_status.get(gid)
                     if download.status != previous:
                         logger.info(
-                            "Status gid=%s %s -> %s downloaded=%s/%s speed=%sB/s avg=%sB/s connections=%s adaptive=%s errorCode=%s error=%r",
+                            "Status gid=%s %s -> %s downloaded=%s/%s speed=%sB/s avg=%sB/s connections=%s optimizer=%s errorCode=%s error=%r",
                             gid,
                             previous or "unknown",
                             download.status,
@@ -211,7 +227,7 @@ class DownloadManager:
             return downloads
 
     @staticmethod
-    def _adaptive_options(connections: int, total_bytes: int) -> dict[str, str]:
+    def _download_options(connections: int, total_bytes: int) -> dict[str, str]:
         if total_bytes >= 1024 * 1024 * 1024:
             min_split_size = "8M"
         elif total_bytes >= 256 * 1024 * 1024:
